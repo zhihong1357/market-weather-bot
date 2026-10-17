@@ -62,6 +62,14 @@ T = {
     "dxy_jump_pct": 1.5,        # 美元指数 5 个交易日上涨 ≥ 1.5%：美元走强，压制风险资产
     "us10y_jump": 0.25,         # 10 年期美债收益率 5 个交易日上升 ≥ 0.25 个百分点
     "put_oi_jump_pct": 50,      # BTC 现价下方 2–8% 的看跌期权持仓 7 天增加 ≥ 50%：大资金在买下跌保护
+    "hy_spread_jump": 0.5,      # 美国高收益债信用利差 5 个交易日走阔 ≥ 0.5 个百分点：信用市场开始紧张
+    "epu_warn": 200,            # 美国政策不确定性指数（7 日均值）> 200：明显紧张
+    "epu_crisis": 300,          # > 300：严重危机级
+    "rv_scale_ratio": 1.5,      # BTC 7 天实现波动率 ≥ 30 天的 1.5 倍：波动率在放大，量化/CTA 可能被迫减仓
+    "rv_scale_min": 50,         # 且 7 天实现波动率（年化）≥ 50%
+    "flow_toxic_pct": 95,       # 24h 主动买卖失衡度处于近 7 天的 95% 分位以上：单边订单流异常集中
+    "cme_am_chg_pct": 20,       # CME 资产管理机构净多仓一周变化 ≥ 20%：机构明显加仓 / 减仓
+    "cliff_gamma_pct": 40,      # 下次月度到期会带走 ≥ 40% 的 BTC 期权 Gamma：到期后减震效果明显变弱
     "move_high_pct": 90,        # 债市恐慌 MOVE 处于 1 年 90% 分位以上
     "vix_low_pct": 50,          # 同时纳指恐慌 VXN（拿不到就用 VIX）在 1 年 50% 分位以下 → 股债"时差"
 }
@@ -129,6 +137,18 @@ LESSONS = [
     "如果债市已经很紧张而股市还很平静，说明风险可能还没被完全反映。",
     "<b>假挂单</b>：盘口上突然出现的大单，很多会在几秒内撤掉，只是用来吓人或引人跟单。"
     "看盘时，真正成交的量比挂着的单更可信。",
+    "<b>冰山订单</b>：真正的大资金很少一次挂出大单，而是用算法拆成成千上万笔小单慢慢成交。"
+    "所以盘口上突然出现的“大墙”往往不是真的，真实的进出要看成交和持仓的变化。",
+    "<b>对冲断崖</b>：月度期权到期后，做市商手上需要对冲的仓位一下子少了很多，"
+    "平时“跌了买、涨了卖”的减震作用跟着变弱。到期后一周左右，一有坏消息波动就容易被放大。",
+    "<b>0DTE 期权</b>：当天到期的期权 Gamma 极高，做市商要跟着价格不停调整对冲，"
+    "会放大日内的来回波动。0DTE 占比越高，盘中越容易出现急拉急跌。",
+    "<b>三级加速</b>：暴跌常分三步：先有人制造假突破引人跟风，再击穿大家的止损位引发集中卖出，"
+    "最后波动率飙升触发量化基金的风控，被迫机械减仓——跌势就这样自我加速。",
+    "<b>新新闻是坏新闻</b>：市场最怕“没见过的事”。出现前所未有的事件组合时，算法和资金会先撤退观望，"
+    "这种不确定性可能压制市场很长时间。政策不确定性指数可以帮你感受这种紧张程度。",
+    "<b>51% 的胜率</b>：量化不求每次都对，只要胜率略高于一半、盈亏比合理、成本够低，"
+    "重复上万次就能稳定赚钱。普通人反过来：别押一次大的，要守住小优势和纪律。",
     "<b>状态比方向重要</b>：先判断现在是什么“天气”，再决定要不要出门。"
     "同一个策略，在静默期可能赚钱，在绞杀期可能被来回打止损。",
 ]
@@ -424,9 +444,10 @@ def fetch_yahoo_closes(symbol):
 
 
 def fetch_fred_dated(series):
-    """美联储圣路易斯分行 FRED 的官方数据，返回 [(日期, 数值)]（空值的日子跳过）。"""
+    """美联储圣路易斯分行 FRED 的官方数据，返回 [(日期, 数值)]（空值的日子跳过），只取最近约 14 个月。"""
+    start = (datetime.now(timezone.utc) - timedelta(days=420)).strftime("%Y-%m-%d")
     r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                     params={"id": series}, headers=UA, timeout=20)
+                     params={"id": series, "cosd": start}, headers=UA, timeout=30)
     r.raise_for_status()
     rows = []
     for line in r.text.strip().splitlines()[1:]:
@@ -498,6 +519,53 @@ def fetch_coinalyze():
         out[c]["exchanges"] = sorted(out[c]["exchanges"])
     out["perp"] = perp
     return out
+
+
+def fetch_flow_imbalance():
+    """Binance BTC 永续最近 7 天每小时的成交量和主动买入量（经 Coinalyze），用来近似“毒性订单流”。"""
+    now = int(time.time())
+    r = cz_get("ohlcv-history", {"symbols": "BTCUSDT_PERP.A", "interval": "1hour",
+                                 "from": now - 7 * 86400, "to": now})
+    return [(x["t"], x["v"], x["bv"]) for x in r[0]["history"]] if r else None
+
+
+# ---------- CME（芝商所）：受美国监管的机构市场 ----------
+CFTC = "https://publicreporting.cftc.gov/resource"
+# CFTC 每周公布的持仓报告（TFF 金融期货分类）；比特币标准合约 5 BTC / 张，微型合约 0.1 BTC / 张
+CME_BTC_CODES = {"133741": 5.0, "133742": 0.1}
+
+
+def fetch_cme_cot():
+    """CFTC 持仓周报：CME 比特币期货 + 期权（Delta 折算）的持仓，以及机构、对冲基金、交易商的多空。"""
+    def pull(dataset):
+        rows = get_json(f"{CFTC}/{dataset}.json", {
+            "$where": "cftc_contract_market_code in('133741','133742')",
+            "$order": "report_date_as_yyyy_mm_dd DESC", "$limit": 8})
+        by_date = {}
+        for r in rows:
+            k = CME_BTC_CODES[r["cftc_contract_market_code"]]
+            d = by_date.setdefault(r["report_date_as_yyyy_mm_dd"][:10], {"oi": 0.0, "am": 0.0, "lev": 0.0, "dealer": 0.0})
+            d["oi"] += num(r["open_interest_all"]) * k
+            d["am"] += (num(r["asset_mgr_positions_long"]) - num(r["asset_mgr_positions_short"])) * k
+            d["lev"] += (num(r["lev_money_positions_long"]) - num(r["lev_money_positions_short"])) * k
+            d["dealer"] += (num(r["dealer_positions_long_all"]) - num(r["dealer_positions_short_all"])) * k
+        return [(d, by_date[d]) for d in sorted(by_date, reverse=True)]
+    combined = pull("yw9f-hn96")   # 期货 + 期权
+    futures = dict(pull("gpe5-46if"))  # 只有期货
+    if not combined:
+        return None
+    date, now = combined[0]
+    prev = combined[1][1] if len(combined) > 1 else None
+    opt_oi = now["oi"] - futures[date]["oi"] if date in futures else None
+    return {"date": date, "now": now, "prev": prev, "options_oi": opt_oi}
+
+
+def fetch_cme_basis():
+    """CME 比特币近月期货的最新价（Yahoo），只在 1 小时内有成交时才用（CME 周末休市）。"""
+    meta = get_json("https://query1.finance.yahoo.com/v8/finance/chart/BTC%3DF",
+                    {"range": "1d", "interval": "1h"})["chart"]["result"][0]["meta"]
+    return {"price": meta["regularMarketPrice"], "time": meta["regularMarketTime"],
+            "name": meta.get("shortName", "")}
 
 
 def fetch_coingecko_global():
@@ -585,6 +653,11 @@ def fetch_all():
     data["cg"] = safe(fetch_coingecko_global, label="CoinGecko", errors=errors)
     data["stable"] = safe(fetch_stablecoins, label="DefiLlama稳定币", errors=errors)
     data["dxy"] = safe(fetch_fred_dated, "DTWEXBGS", label="美元指数(FRED)", errors=errors)
+    data["hy"] = safe(fetch_fred_dated, "BAMLH0A0HYM2", label="信用利差(FRED)", errors=errors)
+    data["epu"] = safe(fetch_fred_dated, "USEPUINDXD", label="政策不确定性(FRED)", errors=errors)
+    data["cme_cot"] = safe(fetch_cme_cot, label="CFTC持仓周报", errors=errors)
+    data["cme_px"] = safe(fetch_cme_basis, label="CME期货价", errors=errors)
+    data["flow"] = safe(fetch_flow_imbalance, label="Coinalyze订单流", errors=errors) if COINALYZE_KEY else None
     data["us10y"] = safe(fetch_fred_dated, "DGS10", label="美债10年(FRED)", errors=errors)
     data["options"] = safe(fetch_btc_options, label="Deribit期权", errors=errors)
     data["dvol"] = safe(fetch_dvol, label="DVOL", errors=errors)
@@ -710,7 +783,8 @@ def dealer_gex(opts, S, now):
 
 def options_metrics(m, data, state):
     opts = data.get("options")
-    for key in ("put_oi", "put_oi_chg7", "put_oi_days", "pcr", "gex", "gamma_flip"):
+    for key in ("put_oi", "put_oi_chg7", "put_oi_days", "pcr", "gex", "gamma_flip",
+                "gamma_0dte_pct", "cliff_pct", "cliff_date"):
         m[key] = None
     if not opts:
         return
@@ -732,6 +806,26 @@ def options_metrics(m, data, state):
     old = [x for x in hist if now - x[0] >= 6.5 * 86400]
     if old and old[-1][1]:
         m["put_oi_chg7"] = (m["put_oi"] / old[-1][1] - 1) * 100
+
+    # 对冲断崖：下一次月度到期（每月最后一个周五）会带走多少期权 Gamma；以及 24 小时内到期（0DTE）的占比
+    gross = {}
+    for o in opts:
+        t = (o["expiry"] - now) / (365 * 86400)
+        if o["oi"] > 0 and o["iv"] and t > 0:
+            g = o["oi"] * bs_gamma(S, o["strike"], max(t, 1 / 8760), o["iv"] / 100)
+            gross[o["expiry"]] = gross.get(o["expiry"], 0.0) + g
+    total = sum(gross.values())
+    m["gamma_0dte_pct"] = m["cliff_pct"] = m["cliff_date"] = None
+    if total:
+        m["gamma_0dte_pct"] = sum(g for e, g in gross.items() if e - now <= 86400) / total * 100
+        today = datetime.fromtimestamp(now, timezone.utc).date()
+        monthly = last_weekday(today.year, today.month, 4).date()
+        if monthly < today:
+            nxt = today.replace(day=28) + timedelta(days=4)
+            monthly = last_weekday(nxt.year, nxt.month, 4).date()
+        m["cliff_date"] = monthly
+        m["cliff_pct"] = sum(g for e, g in gross.items()
+                             if datetime.fromtimestamp(e, timezone.utc).date() == monthly) / total * 100
 
     # 做市商 Gamma：现价处的敞口，以及往上下 15% 内找 Gamma 由正转负的“翻转价”
     m["gex"] = dealer_gex(opts, S, now)
@@ -778,6 +872,37 @@ def market_wide_metrics(m, data, state):
     m["stable"] = st[-1][1] if st else None
     m["stable_chg7"] = (st[-1][1] / st[-8][1] - 1) * 100 if st and len(st) >= 8 else None
     m["stable_chg30"] = (st[-1][1] / st[-31][1] - 1) * 100 if st and len(st) >= 31 else None
+    # 毒性订单流（近似 VPIN）：每小时 |主动买 − 主动卖| / 成交量，按成交量加权，24 小时为一个窗口
+    m["flow_imb"] = m["flow_imb_pct"] = m["flow_net"] = None
+    fl = data.get("flow")
+    if fl and len(fl) >= 48:
+        def window(rows):
+            v = sum(r[1] for r in rows)
+            return (sum(abs(2 * r[2] - r[1]) for r in rows) / v, (2 * sum(r[2] for r in rows) - v) / v) if v else (None, None)
+        m["flow_imb"], m["flow_net"] = window(fl[-24:])
+        hist = [window(fl[i - 24:i])[0] for i in range(24, len(fl) + 1)]
+        m["flow_imb_pct"] = percentile_rank(hist, m["flow_imb"])
+
+    # 信用利差（美国高收益债 OAS）和政策不确定性指数
+    hy = data.get("hy")
+    m["hy"] = hy[-1][1] if hy else None
+    m["hy_pct"] = percentile_rank([v for _, v in hy[-260:]], m["hy"]) if hy else None
+    m["hy_chg5"] = hy[-1][1] - hy[-6][1] if hy and len(hy) >= 6 else None
+    epu = data.get("epu")
+    m["epu"] = sum(v for _, v in epu[-7:]) / len(epu[-7:]) if epu else None
+
+    # CME：期货溢价 + CFTC 持仓周报
+    px = data.get("cme_px")
+    m["cme_basis"] = m["cme_name"] = None
+    if px and m.get("btc_price") and time.time() - px["time"] <= 3600:
+        m["cme_basis"] = (px["price"] / m["btc_price"] - 1) * 100
+        m["cme_name"] = px["name"]
+    cot = data.get("cme_cot")
+    m["cme"] = cot
+    m["cme_am_chg"] = None
+    if cot and cot["prev"] and cot["prev"]["am"] > 0:
+        m["cme_am_chg"] = (cot["now"]["am"] / cot["prev"]["am"] - 1) * 100
+
     for key in ("dxy", "us10y"):
         rows = data.get(key)
         m[key] = rows[-1][1] if rows else None
@@ -807,6 +932,7 @@ def compute_metrics(data, state):
 
     m["adx"] = m["atr"] = m["atr_pct"] = m["vol_ratio"] = None
     m["vol_low_5d"] = False
+    m["rv7"] = m["rv30"] = None
     m["daily_src"] = daily["sources"] if daily else []
     if daily and len(daily["close"]) > 40:
         # combine_daily 已经去掉了今天还没走完的那根 K 线
@@ -821,6 +947,15 @@ def compute_metrics(data, state):
             m["vol_ratio"] = avg5 / avg30 if avg30 else None
             # 最近 5 天是不是每一天都低于 30 天平均
             m["vol_low_5d"] = all(x < avg30 for x in v[-5:])
+        # 实现波动率（年化 %）：用每天收盘价的对数涨跌幅计算
+        rets = [math.log(c[i] / c[i - 1]) for i in range(1, len(c)) if c[i] and c[i - 1]]
+
+        def rv(n):
+            x = rets[-n:]
+            mu = sum(x) / len(x)
+            return math.sqrt(sum((r - mu) ** 2 for r in x) / (len(x) - 1)) * math.sqrt(365) * 100
+        if len(rets) >= 30:
+            m["rv7"], m["rv30"] = rv(7), rv(30)
 
     m["dvol"] = dvol and dvol["now"]
     m["dvol_d1"] = dvol and dvol["d1"]
@@ -966,8 +1101,10 @@ def expiry_warnings(today):
         if 0 <= diff <= 2:
             when = "今天" if diff == 0 else f"{diff} 天后（{d.month}月{d.day}日）"
             out.append(f"📅 {when}是{name}到期日，前后几天做市商对冲变化大，波动容易放大。")
-        elif -1 <= diff < 0:
-            out.append(f"📅 昨天{name}刚到期，做市商的“减震”作用变弱，波动可能放大。")
+        elif -9 <= diff < 0:
+            # 对冲断崖：到期后约 7 个交易日，做市商的对冲盘大幅减少，减震效果变弱
+            out.append(f"🧱 对冲断崖期：{name}在 {d.month}月{d.day}日到期（{-diff} 天前），之后约 7 个交易日做市商的"
+                       "“高抛低吸”减震变弱，一有外部冲击波动就容易被放大。")
     return out
 
 
@@ -991,10 +1128,39 @@ def radar(m, today):
     if m["gex"] is not None and m["gex"] < 0:
         w.append("⚙️ 做市商处于负 Gamma（放大器档，估算）：涨跌容易被对冲盘放大，固定窄止损容易被瞬间扫掉，"
                  "宜减仓、按波动放宽止损或观望。")
+    if (m["cliff_pct"] is not None and m["cliff_pct"] >= T["cliff_gamma_pct"] and m["cliff_date"]
+            and 0 <= (m["cliff_date"] - datetime.now(timezone.utc).date()).days <= 3):
+        d = m["cliff_date"]
+        w.append(f"🧱 {d.month}月{d.day}日的 BTC 月度期权到期会带走约 {m['cliff_pct']:.0f}% 的期权 Gamma："
+                 "到期后做市商的减震作用会明显变弱。")
+    if (gte(m["rv7"], T["rv_scale_min"]) and m["rv30"]
+            and m["rv7"] >= m["rv30"] * T["rv_scale_ratio"]):
+        w.append(f"🌀 波动率在放大：BTC 7 天实现波动率 {m['rv7']:.0f}%，是 30 天（{m['rv30']:.0f}%）的 "
+                 f"{m['rv7'] / m['rv30']:.1f} 倍。量化 / CTA 的风控模型可能被迫机械减仓，跌势容易自我加速。")
+    if gte(m["flow_imb_pct"], T["flow_toxic_pct"]):
+        side = "卖" if (m["flow_net"] or 0) < 0 else "买"
+        w.append(f"☣️ 订单流异常单边（近似毒性订单流）：近 24h 主动{side}单明显占优，失衡度是近 7 天最高的一档。"
+                 "做市商可能撤单、价差变大，留意插针。")
+    if gte(m["hy_chg5"], T["hy_spread_jump"]):
+        w.append(f"💳 美国高收益债信用利差 5 个交易日走阔 {m['hy_chg5']:.2f} 个百分点：信用市场开始紧张，"
+                 "风险通常会接着传到股市。")
+    if gte(m["epu"], T["epu_crisis"]):
+        w.append(f"🏛 美国政策不确定性指数 {m['epu']:.0f}（7 日均值）：已到严重危机级，市场可能长时间高波动或受压。")
+    elif gte(m["epu"], T["epu_warn"]):
+        w.append(f"🏛 美国政策不确定性指数 {m['epu']:.0f}（7 日均值）：明显紧张，新消息容易引发大波动。")
+    if m["cme_am_chg"] is not None and abs(m["cme_am_chg"]) >= T["cme_am_chg_pct"]:
+        act = "加仓" if m["cme_am_chg"] > 0 else "减仓"
+        w.append(f"🏦 CME 资产管理机构净多仓一周{act} {abs(m['cme_am_chg']):.0f}%（CFTC 周报）：传统机构在明显{act}比特币。")
     eq_name, eq_pct = ("纳指 VXN", m["vxn_pct"]) if m["vxn_pct"] is not None else ("美股 VIX", m["vix_pct"])
-    if gte(m["move_pct"], T["move_high_pct"]) and eq_pct is not None and eq_pct <= T["vix_low_pct"]:
-        w.append(f"⏳ 股债时差：债市恐慌 MOVE 在一年 {m['move_pct']:.0f}% 分位，{eq_name} 只在 {eq_pct:.0f}% 分位。"
-                 "债市已经紧张、股市还平静，风险可能还没完全反映出来。")
+    credit_hot = gte(m["hy_pct"], 80)
+    if (gte(m["move_pct"], T["move_high_pct"]) or credit_hot) and eq_pct is not None and eq_pct <= T["vix_low_pct"]:
+        lead = []
+        if gte(m["move_pct"], T["move_high_pct"]):
+            lead.append(f"债市恐慌 MOVE 在一年 {m['move_pct']:.0f}% 分位")
+        if credit_hot:
+            lead.append(f"信用利差在一年 {m['hy_pct']:.0f}% 分位")
+        w.append(f"⏳ 股债时差：{'、'.join(lead)}，{eq_name} 只在 {eq_pct:.0f}% 分位。"
+                 "债市、信用市场已经紧张，股市还平静，风险可能还没完全反映出来（传导顺序：债市 → 信用 → 个股期权 → 指数）。")
     if m["vix"] is not None and T["vix_warn"] <= m["vix"] < T["vix_burst"]:
         w.append(f"🇺🇸 美股恐慌指数 VIX 升到 {m['vix']:.0f}：美股紧张时，币市常被一起拖累。")
     if gte(m["dvol_jump"], 10) and not gte(m["dvol_jump"], T["dvol_jump_pct"]):
@@ -1074,6 +1240,8 @@ def readings_block(m):
         L.append(f"恐惧贪婪指数：{m['fng']}（{lvl_fng(m['fng'])}）")
     if m["adx"] is not None:
         L.append(f"趋势强度 ADX：{m['adx']:.0f}（{lvl_adx(m['adx'])}）")
+    if m["rv7"] is not None:
+        L.append(f"BTC 实现波动率（年化）：7 天 {m['rv7']:.0f}% / 30 天 {m['rv30']:.0f}%")
     if m["vol_ratio"] is not None:
         L.append(f"近 5 天现货成交量：平时的 {m['vol_ratio'] * 100:.0f}%（{len(m['daily_src'])} 家合计）")
 
@@ -1105,6 +1273,9 @@ def readings_block(m):
             L.append(f"{c} 24h 爆仓：" + " · ".join(parts))
     if m["btc_liq_long"] is not None and m["liq_note"]:
         L.append(f"<i>自采爆仓：{m['liq_note']}</i>")
+    if m["flow_imb"] is not None:
+        side = "主动卖单占优" if m["flow_net"] < 0 else "主动买单占优"
+        L.append(f"订单流失衡（近似毒性订单流）：{m['flow_imb']:.2f}，{side}（近 7 天 {m['flow_imb_pct']:.0f}% 分位，Binance BTC）")
 
     if m["gex"] is not None:
         L += ["", "🎛 <b>期权与做市商</b>（BTC，Deribit）"]
@@ -1114,8 +1285,9 @@ def readings_block(m):
         if m["gamma_flip"] and m["btc_price"]:
             gap = (m["btc_price"] / m["gamma_flip"] - 1) * 100
             if abs(gap) <= 3:
-                L.append(f"<i>离翻转价只有 {abs(gap):.1f}%：" + ("跌破后会切到放大器档，波动可能突然变大</i>" if gap > 0
-                         else "涨回上方后会切回减震器档，波动会变小</i>"))
+                move = "跌破" if gap > 0 else "涨过"
+                to = "放大器档，波动可能突然变大" if m["gex"] >= 0 else "减震器档，波动会变小"
+                L.append(f"<i>离翻转价只有 {abs(gap):.1f}%：{move}翻转价后会切到{to}</i>")
         if m["put_oi_chg7"] is not None:
             chg = f"7 天 {fmt_pct(m['put_oi_chg7'], 0)}"
         else:
@@ -1123,6 +1295,33 @@ def readings_block(m):
         L.append(f"下跌保护：现价下方 2–8% 的看跌持仓 {m['put_oi']:,.0f} BTC（30 天内到期，{chg}）")
         if m["pcr"] is not None:
             L.append(f"看跌 / 看涨持仓比：{m['pcr']:.2f}" + ("（看跌偏多）" if m["pcr"] >= 1 else ""))
+        if m["cliff_pct"] is not None:
+            d = m["cliff_date"]
+            L.append(f"对冲断崖：{d.month}月{d.day}日月度到期会带走 {m['cliff_pct']:.0f}% 的期权 Gamma；"
+                     f"24 小时内到期（0DTE）占 {m['gamma_0dte_pct']:.0f}%")
+
+    cme = m.get("cme")
+    if cme or m.get("cme_basis") is not None:
+        L += ["", "🏛 <b>CME 机构市场</b>（芝商所，受美国监管）"]
+        if m["cme_basis"] is not None:
+            L.append(f"期货溢价：{fmt_pct(m['cme_basis'], 2)}（{esc(m['cme_name'])}，相对现货）")
+        if cme:
+            n, p = cme["now"], cme["prev"]
+            price = m["btc_price"] or 0
+            opt = (f"，其中期权（Delta 折算）约 {cme['options_oi']:,.0f} BTC"
+                   if cme["options_oi"] is not None else "")
+            L.append(f"持仓：{n['oi']:,.0f} BTC（约 {fmt_busd(n['oi'] * price)}{opt}）· CFTC 周报 {cme['date'][5:]}")
+
+            def who(name, key, note=""):
+                side = "净多" if n[key] >= 0 else "净空"
+                chg = ""
+                if p:
+                    d = abs(n[key]) - abs(p[key]) if (n[key] >= 0) == (p[key] >= 0) else None
+                    chg = (f"，一周{'增加' if d >= 0 else '减少'} {abs(d):,.0f}" if d is not None
+                           else "，这周刚由" + ("净空转为净多" if n[key] >= 0 else "净多转为净空"))
+                return f"{name}{side} {abs(n[key]):,.0f} BTC{chg}{note}"
+            L.append(who("资产管理机构", "am"))
+            L.append(who("杠杆基金", "lev", "（多为“买现货/ETF、空期货”的套利，不一定是看空）"))
 
     macro = []
     if m["total_mcap"] is not None:
@@ -1141,6 +1340,12 @@ def readings_block(m):
         macro.append(f"纳斯达克 100：上个交易日 {fmt_pct(m['ndx_chg'])}")
     if m["move_pct"] is not None:
         macro.append(f"债市恐慌 MOVE：一年内 {m['move_pct']:.0f}% 分位")
+    if m["hy"] is not None:
+        chg = f"{m['hy_chg5']:+.2f}" if m["hy_chg5"] is not None else "—"
+        macro.append(f"美国高收益债信用利差：{m['hy']:.2f}%（5 日 {chg}，一年内 {m['hy_pct']:.0f}% 分位）")
+    if m["epu"] is not None:
+        lvl = "严重" if m["epu"] >= T["epu_crisis"] else "紧张" if m["epu"] >= T["epu_warn"] else "正常"
+        macro.append(f"政策不确定性指数：{m['epu']:.0f}（7 日均值，{lvl}）")
     if m["dxy"] is not None:
         macro.append(f"美元指数（广义）：{m['dxy']:.1f}（5 日 {fmt_pct(m['dxy_chg5'])}，{m['dxy_date']}）")
     if m["us10y"] is not None:
@@ -1174,7 +1379,8 @@ def sources_block(m):
             + ("；总市值：CoinGecko" if m["total_mcap"] is not None else "")
             + ("；稳定币：DefiLlama" if m["stable"] is not None else "")
             + ("；期权：Deribit" if m["gex"] is not None else "")
-            + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED；美元/美债：FRED</i>")
+            + ("；CME：CFTC 持仓周报 / Yahoo" if m.get("cme") or m.get("cme_basis") is not None else "")
+            + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED；美元/美债/信用利差/政策不确定性：FRED</i>")
 
 
 def stop_tip(m):
