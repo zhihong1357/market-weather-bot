@@ -140,6 +140,11 @@ def get_json(url, params=None, timeout=20, tries=2):
             r = requests.get(url, params=params, headers=UA, timeout=timeout)
             r.raise_for_status()
             return r.json()
+        except requests.HTTPError as e:
+            if e.response is not None and 400 <= e.response.status_code < 500:
+                raise  # 地区限制 / 参数错误，重试也没用
+            last = e
+            time.sleep(2)
         except Exception as e:  # noqa
             last = e
             time.sleep(2)
@@ -170,42 +175,177 @@ def percentile_rank(values, v):
 
 
 # ============================================================
-# 数据获取（每个来源单独容错：拿不到就显示“—”，不影响其他）
+# 数据获取
+# 原则：
+#   - 价格、资金费率、持仓量、成交量都同时向多家交易所取，各家原始数字一起汇总，不依赖单一来源
+#   - 每家交易所单独容错：某家拿不到就跳过，报告里注明用了几家、哪几家失败
+#   - 拿不到的数据就显示“—”，绝不用别的数据去推算代替
 # ============================================================
+COINS = ("BTC", "ETH")
 DERIBIT = "https://www.deribit.com/api/v2/public"
 
 
-def fetch_ticker(instrument):
-    d = get_json(f"{DERIBIT}/ticker", {"instrument_name": instrument})["result"]
-    return {
-        "price": d.get("index_price") or d.get("last_price"),
-        "chg24": (d.get("stats") or {}).get("price_change"),
-        "funding_8h": d.get("funding_8h"),
-        "oi": d.get("open_interest"),
-    }
+def num(x):
+    return float(x) if x not in (None, "") else None
 
 
-def fetch_btc_daily_deribit(days=120):
-    end = int(time.time() * 1000)
-    start = end - days * 86400 * 1000
-    d = get_json(f"{DERIBIT}/get_tradingview_chart_data", {
-        "instrument_name": "BTC-PERPETUAL", "start_timestamp": start,
-        "end_timestamp": end, "resolution": "1D"})["result"]
-    return {"high": d["high"], "low": d["low"], "close": d["close"],
-            "volume": d.get("cost") or d["volume"], "ticks": d["ticks"]}
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    k = len(xs) // 2
+    return xs[k] if len(xs) % 2 else (xs[k - 1] + xs[k]) / 2
 
 
-def fetch_btc_daily_coinbase():
-    # 备用来源：Coinbase（返回最新在前，需要倒序）
-    rows = get_json("https://api.exchange.coinbase.com/products/BTC-USD/candles",
-                    {"granularity": 86400})
-    rows = sorted(rows, key=lambda r: r[0])
-    return {"high": [r[2] for r in rows], "low": [r[1] for r in rows],
-            "close": [r[4] for r in rows], "volume": [r[5] * r[4] for r in rows],
-            "ticks": [r[0] * 1000 for r in rows]}
+# ---------- 现货：最新价 + 交易所自己公布的 24 小时涨跌 ----------
+# 每个函数返回 {"price": 最新价, "chg24": 24h 涨跌 %（交易所不提供就是 None）}
+def spot_coinbase(coin):
+    d = get_json(f"https://api.exchange.coinbase.com/products/{coin}-USD/stats")
+    last, op = num(d["last"]), num(d["open"])  # open = 24 小时前的价格
+    return {"price": last, "chg24": (last / op - 1) * 100 if op else None}
 
 
+def spot_kraken(coin):
+    d = get_json("https://api.kraken.com/0/public/Ticker", {"pair": {"BTC": "XBTUSD"}.get(coin, coin + "USD")})
+    if d.get("error"):
+        raise RuntimeError(d["error"])
+    r = next(iter(d["result"].values()))
+    return {"price": num(r["c"][0]), "chg24": None}  # Kraken 不公布滚动 24h 涨跌，只取价格
+
+
+def spot_bitstamp(coin):
+    d = get_json(f"https://www.bitstamp.net/api/v2/ticker/{coin.lower()}usd/")
+    return {"price": num(d["last"]), "chg24": num(d.get("percent_change_24"))}
+
+
+def spot_okx(coin):
+    d = get_json("https://www.okx.com/api/v5/market/ticker", {"instId": f"{coin}-USDT"})["data"][0]
+    last, op = num(d["last"]), num(d["open24h"])
+    return {"price": last, "chg24": (last / op - 1) * 100 if op else None}
+
+
+def spot_binance(coin):
+    d = get_json("https://data-api.binance.vision/api/v3/ticker/24hr", {"symbol": f"{coin}USDT"})
+    return {"price": num(d["lastPrice"]), "chg24": num(d["priceChangePercent"])}
+
+
+SPOT_SOURCES = {"Coinbase": spot_coinbase, "Kraken": spot_kraken, "Bitstamp": spot_bitstamp,
+                "OKX": spot_okx, "Binance": spot_binance}
+
+
+# ---------- 永续合约：资金费率（统一换算成每 8 小时）+ 持仓量（美元） ----------
+# 每个函数返回 {"funding_8h": 小数, "oi_usd": 美元}；拿不到的字段为 None
+def perp_deribit(coin):
+    d = get_json(f"{DERIBIT}/ticker", {"instrument_name": f"{coin}-PERPETUAL"})["result"]
+    return {"funding_8h": d.get("funding_8h"), "oi_usd": d.get("open_interest")}  # Deribit 永续持仓以美元计
+
+
+def perp_okx(coin):
+    inst = f"{coin}-USDT-SWAP"
+    fr = get_json("https://www.okx.com/api/v5/public/funding-rate", {"instId": inst})["data"][0]
+    hours = (int(fr["nextFundingTime"]) - int(fr["fundingTime"])) / 3600000 or 8
+    oi = get_json("https://www.okx.com/api/v5/public/open-interest",
+                  {"instType": "SWAP", "instId": inst})["data"][0]
+    return {"funding_8h": num(fr["fundingRate"]) * 8 / hours, "oi_usd": num(oi.get("oiUsd"))}
+
+
+def perp_bitget(coin):
+    q = {"symbol": f"{coin}USDT", "productType": "usdt-futures"}
+    t = get_json("https://api.bitget.com/api/v2/mix/market/ticker", q)["data"][0]
+    fr = get_json("https://api.bitget.com/api/v2/mix/market/current-fund-rate", q)["data"][0]
+    hours = int(fr.get("fundingRateInterval") or 8)
+    # 持仓量以币计，按标记价格换算成美元
+    return {"funding_8h": num(t["fundingRate"]) * 8 / hours,
+            "oi_usd": num(t["holdingAmount"]) * num(t["markPrice"])}
+
+
+def perp_gate(coin):
+    c = get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{coin}_USDT")
+    st = get_json("https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                  {"contract": f"{coin}_USDT", "interval": "5m", "limit": 1})
+    hours = int(c.get("funding_interval") or 28800) / 3600
+    return {"funding_8h": num(c["funding_rate"]) * 8 / hours,
+            "oi_usd": num(st[-1]["open_interest_usd"]) if st else None}
+
+
+def perp_hyperliquid(coin):
+    r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "metaAndAssetCtxs"},
+                      headers=UA, timeout=15)
+    r.raise_for_status()
+    meta, ctxs = r.json()
+    for a, c in zip(meta["universe"], ctxs):
+        if a["name"] == coin:
+            # Hyperliquid 每小时结算一次资金费；持仓量以币计，按标记价格换算成美元
+            return {"funding_8h": num(c["funding"]) * 8, "oi_usd": num(c["openInterest"]) * num(c["markPx"])}
+    raise KeyError(coin)
+
+
+# Binance 合约、Bybit 会拒绝来自 GitHub 美国服务器的请求，所以这里不用它们
+PERP_SOURCES = {"OKX": perp_okx, "Bitget": perp_bitget, "Gate": perp_gate,
+                "Deribit": perp_deribit, "Hyperliquid": perp_hyperliquid}
+
+
+# ---------- BTC 现货日 K 线（UTC 日），用来算 ADX、日均波动和成交量 ----------
+# 每个函数返回 {当天 0 点的 UTC 时间戳(秒): (最高, 最低, 收盘, 成交量[BTC])}
+def daily_coinbase():
+    rows = get_json("https://api.exchange.coinbase.com/products/BTC-USD/candles", {"granularity": 86400})
+    return {int(r[0]): (r[2], r[1], r[4], r[5]) for r in rows}
+
+
+def daily_kraken():
+    d = get_json("https://api.kraken.com/0/public/OHLC", {"pair": "XBTUSD", "interval": 1440})
+    if d.get("error"):
+        raise RuntimeError(d["error"])
+    rows = next(v for k, v in d["result"].items() if k != "last")
+    return {int(r[0]): (num(r[2]), num(r[3]), num(r[4]), num(r[6])) for r in rows}
+
+
+def daily_bitstamp():
+    rows = get_json("https://www.bitstamp.net/api/v2/ohlc/btcusd/",
+                    {"step": 86400, "limit": 120})["data"]["ohlc"]
+    return {int(r["timestamp"]): (num(r["high"]), num(r["low"]), num(r["close"]), num(r["volume"])) for r in rows}
+
+
+def daily_okx():
+    rows = get_json("https://www.okx.com/api/v5/market/candles",
+                    {"instId": "BTC-USDT", "bar": "1Dutc", "limit": 120})["data"]
+    return {int(r[0]) // 1000: (num(r[2]), num(r[3]), num(r[4]), num(r[5])) for r in rows}
+
+
+def daily_binance():
+    rows = get_json("https://data-api.binance.vision/api/v3/klines",
+                    {"symbol": "BTCUSDT", "interval": "1d", "limit": 120})
+    return {int(r[0]) // 1000: (num(r[2]), num(r[3]), num(r[4]), num(r[5])) for r in rows}
+
+
+DAILY_SOURCES = {"Coinbase": daily_coinbase, "Kraken": daily_kraken, "Bitstamp": daily_bitstamp,
+                 "OKX": daily_okx, "Binance": daily_binance}
+
+
+def combine_daily(per_ex):
+    """只保留所有成功来源都有数据、且已经走完的日子：
+    高 / 低 / 收盘取各家中位数，成交量把各家相加（单位都是 BTC）。"""
+    today0 = int(time.time()) // 86400 * 86400
+    days = None
+    for rows in per_ex.values():
+        ks = {k for k in rows if k < today0}
+        days = ks if days is None else days & ks
+    days = sorted(days or [])[-120:]
+    if not days:
+        return None
+    out = {"high": [], "low": [], "close": [], "volume": [], "ticks": days, "sources": list(per_ex)}
+    for d in days:
+        rows = [per_ex[ex][d] for ex in per_ex]
+        out["high"].append(median(r[0] for r in rows))
+        out["low"].append(median(r[1] for r in rows))
+        out["close"].append(median(r[2] for r in rows))
+        out["volume"].append(sum(r[3] for r in rows))
+    return out
+
+
+# ---------- 只有单一发布方的指数 ----------
 def fetch_dvol(hours=8 * 24):
+    # DVOL 是 Deribit 编制并发布的指数（Deribit 占 BTC 期权成交的大头），没有第二个发布方
     end = int(time.time() * 1000)
     start = end - hours * 3600 * 1000
     rows = get_json(f"{DERIBIT}/get_volatility_index_data", {
@@ -242,9 +382,10 @@ def fetch_yahoo_closes(symbol):
     return None
 
 
-def fetch_vix_fred():
+def fetch_fred(series):
+    # 美联储圣路易斯分行 FRED 的官方收盘数据，作为 Yahoo 拿不到时的第二来源
     r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
-                     params={"id": "VIXCLS"}, headers=UA, timeout=20)
+                     params={"id": series}, headers=UA, timeout=20)
     r.raise_for_status()
     vals = []
     for line in r.text.strip().splitlines()[1:]:
@@ -266,28 +407,28 @@ def safe(fn, *a, label="", errors=None):
         return None
 
 
+def collect(sources, kind, errors, *a):
+    out = {}
+    for name, fn in sources.items():
+        r = safe(fn, *a, label=f"{name} {kind}", errors=errors)
+        if r:
+            out[name] = r
+    return out
+
+
 def fetch_all():
     errors = []
     data = {"errors": errors}
-    data["btc"] = safe(fetch_ticker, "BTC-PERPETUAL", label="BTC", errors=errors)
-    data["eth"] = safe(fetch_ticker, "ETH-PERPETUAL", label="ETH", errors=errors)
-    daily = safe(fetch_btc_daily_deribit, label="BTC日线", errors=errors)
-    if not daily:
-        daily = safe(fetch_btc_daily_coinbase, label="BTC日线(备用)", errors=errors)
-    data["daily"] = daily
+    data["spot"] = {c: collect(SPOT_SOURCES, f"{c}现货", errors, c) for c in COINS}
+    data["perp"] = {c: collect(PERP_SOURCES, f"{c}合约", errors, c) for c in COINS}
+    data["daily"] = combine_daily(collect(DAILY_SOURCES, "日线", errors))
     data["dvol"] = safe(fetch_dvol, label="DVOL", errors=errors)
     data["fng"] = safe(fetch_fng, label="恐惧贪婪", errors=errors)
-    vix = safe(fetch_yahoo_closes, "^VIX", label="VIX", errors=errors)
-    if not vix:
-        vix = safe(fetch_vix_fred, label="VIX(备用)", errors=errors)
-    data["vix_series"] = vix
+    data["vix_series"] = (safe(fetch_yahoo_closes, "^VIX", label="VIX(Yahoo)", errors=errors)
+                          or safe(fetch_fred, "VIXCLS", label="VIX(FRED)", errors=errors))
     data["move_series"] = safe(fetch_yahoo_closes, "^MOVE", label="MOVE", errors=errors)
-    data["ndx_series"] = safe(fetch_yahoo_closes, "^NDX", label="纳指", errors=errors)
-    # 如果 Deribit 的 BTC 行情拿不到，用日线补价格和 24h 涨跌
-    if not data["btc"] and daily and len(daily["close"]) >= 2:
-        c = daily["close"]
-        data["btc"] = {"price": c[-1], "chg24": (c[-1] / c[-2] - 1) * 100,
-                       "funding_8h": None, "oi": None}
+    data["ndx_series"] = (safe(fetch_yahoo_closes, "^NDX", label="纳指(Yahoo)", errors=errors)
+                          or safe(fetch_fred, "NASDAQ100", label="纳指(FRED)", errors=errors))
     return data
 
 
@@ -321,21 +462,41 @@ def wilder_adx_atr(high, low, close, n=14):
     return adx, atr
 
 
+def funding_summary(perps):
+    """资金费率：各家都有持仓量时按持仓量加权平均，否则取中位数；同时给出各家的最低和最高。"""
+    rates = {ex: p["funding_8h"] for ex, p in perps.items() if p.get("funding_8h") is not None}
+    if not rates:
+        return None, None, None, 0, ""
+    w = {ex: perps[ex].get("oi_usd") for ex in rates}
+    if all(w.values()):
+        avg, how = sum(rates[ex] * w[ex] for ex in rates) / sum(w.values()), "持仓加权"
+    else:
+        avg, how = median(rates.values()), "中位数"
+    return avg, min(rates.values()), max(rates.values()), len(rates), how
+
+
 def compute_metrics(data, state):
-    m = {}
-    btc, eth, daily, dvol = data.get("btc"), data.get("eth"), data.get("daily"), data.get("dvol")
-    m["btc_price"] = btc and btc.get("price")
-    m["btc_chg24"] = btc and btc.get("chg24")
-    m["btc_funding"] = btc and btc.get("funding_8h")
-    m["btc_oi"] = btc and btc.get("oi")
-    m["eth_price"] = eth and eth.get("price")
-    m["eth_chg24"] = eth and eth.get("chg24")
-    m["eth_funding"] = eth and eth.get("funding_8h")
+    m = {"errors": data.get("errors", [])}
+    spot, perp, daily, dvol = data.get("spot", {}), data.get("perp", {}), data.get("daily"), data.get("dvol")
+    for c in COINS:
+        k = c.lower()
+        s = spot.get(c, {})
+        m[f"{k}_price"] = median(x["price"] for x in s.values())
+        m[f"{k}_chg24"] = median(x["chg24"] for x in s.values())
+        m[f"{k}_spot_src"] = list(s)
+        p = perp.get(c, {})
+        (m[f"{k}_funding"], m[f"{k}_funding_min"], m[f"{k}_funding_max"],
+         m[f"{k}_funding_n"], m[f"{k}_funding_how"]) = funding_summary(p)
+        oi = {ex: x["oi_usd"] for ex, x in p.items() if x.get("oi_usd")}
+        m[f"{k}_oi_by_ex"] = oi
+        m[f"{k}_oi"] = sum(oi.values()) if oi else None
+        m[f"{k}_perp_src"] = list(p)
 
     m["adx"] = m["atr"] = m["atr_pct"] = m["vol_ratio"] = None
+    m["daily_src"] = daily["sources"] if daily else []
     if daily and len(daily["close"]) > 40:
-        # 去掉今天还没走完的那根 K 线
-        h, l, c, v = daily["high"][:-1], daily["low"][:-1], daily["close"][:-1], daily["volume"][:-1]
+        # combine_daily 已经去掉了今天还没走完的那根 K 线
+        h, l, c, v = daily["high"], daily["low"], daily["close"], daily["volume"]
         adx, atr = wilder_adx_atr(h, l, c)
         m["adx"], m["atr"] = adx, atr
         if atr and c[-1]:
@@ -361,18 +522,20 @@ def compute_metrics(data, state):
     ns = data.get("ndx_series")
     m["ndx_chg"] = ((ns[-1] / ns[-2] - 1) * 100) if ns and len(ns) >= 2 else None
 
-    # 持仓量 24h 变化（用自己保存的历史）
+    # BTC 合约持仓量 24h 变化（用自己保存的各家历史；只比较两次都拿到数据的交易所，避免家数变化造成假涨跌）
     m["oi_chg"] = None
-    hist = state.get("oi_history", [])
+    now_oi = m["btc_oi_by_ex"]
+    hist = [x for x in state.get("oi_history", []) if isinstance(x[1], dict)]
     now_ts = int(time.time())
-    if m["btc_oi"]:
+    if now_oi:
         old = [x for x in hist if now_ts - x[0] >= 20 * 3600]
         if old:
             base = old[-1][1]
-            if base:
-                m["oi_chg"] = (m["btc_oi"] / base - 1) * 100
-        hist.append([now_ts, m["btc_oi"]])
-        state["oi_history"] = [x for x in hist if now_ts - x[0] <= 48 * 3600]
+            common = [ex for ex in now_oi if base.get(ex)]
+            if common:
+                m["oi_chg"] = (sum(now_oi[ex] for ex in common) / sum(base[ex] for ex in common) - 1) * 100
+        hist.append([now_ts, now_oi])
+    state["oi_history"] = [x for x in hist if now_ts - x[0] <= 48 * 3600]
     return m
 
 
@@ -534,18 +697,27 @@ def lvl_funding(x):
 
 def readings_block(m):
     L = ["📊 <b>关键读数</b>"]
-    L.append(f"BTC {fmt_money(m['btc_price'])}（24h {fmt_pct(m['btc_chg24'])}）")
-    L.append(f"ETH {fmt_money(m['eth_price'])}（24h {fmt_pct(m['eth_chg24'])}）")
+    for c in COINS:
+        k = c.lower()
+        L.append(f"{c} {fmt_money(m[k + '_price'])}（24h {fmt_pct(m[k + '_chg24'])}）"
+                 f"· {len(m[k + '_spot_src'])} 家现货中位数")
     if m["dvol"] is not None:
         L.append(f"币市恐慌度 DVOL：{m['dvol']:.0f}（{lvl_dvol(m['dvol'])}）")
-    if m["btc_funding"] is not None:
-        L.append(f"BTC 资金费率：{m['btc_funding'] * 100:.4f}%/8h（{lvl_funding(m['btc_funding'])}）")
+    for c in COINS:
+        k = c.lower()
+        if m[k + "_funding"] is not None:
+            L.append(f"{c} 资金费率：{m[k + '_funding'] * 100:.4f}%/8h（{lvl_funding(m[k + '_funding'])}）"
+                     f"· {m[k + '_funding_n']} 家{m[k + '_funding_how']}，各家 {m[k + '_funding_min'] * 100:.4f}% ~ "
+                     f"{m[k + '_funding_max'] * 100:.4f}%")
+    if m["btc_oi"] is not None:
+        L.append(f"BTC 合约持仓：${m['btc_oi'] / 1e9:.1f}B（{len(m['btc_oi_by_ex'])} 家合计）"
+                 + (f"，24h {fmt_pct(m['oi_chg'])}" if m["oi_chg"] is not None else ""))
     if m["fng"] is not None:
         L.append(f"恐惧贪婪指数：{m['fng']}（{lvl_fng(m['fng'])}）")
     if m["adx"] is not None:
         L.append(f"趋势强度 ADX：{m['adx']:.0f}（{lvl_adx(m['adx'])}）")
     if m["vol_ratio"] is not None:
-        L.append(f"近 5 天成交量：平时的 {m['vol_ratio'] * 100:.0f}%")
+        L.append(f"近 5 天现货成交量：平时的 {m['vol_ratio'] * 100:.0f}%（{len(m['daily_src'])} 家合计）")
     if m["vix"] is not None:
         L.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}）")
     if m["ndx_chg"] is not None:
@@ -553,6 +725,27 @@ def readings_block(m):
     if m["move_pct"] is not None:
         L.append(f"债市恐慌 MOVE：一年内 {m['move_pct']:.0f}% 分位")
     return "\n".join(L)
+
+
+def failed_summary(errors):
+    """把 "Binance BTC现货: HTTPError" 这类错误按来源归类成 "Binance（BTC现货、日线）"。"""
+    groups = {}
+    for e in errors:
+        label = e.split(":")[0]
+        name, _, kind = label.partition(" ")
+        groups.setdefault(name, [])
+        if kind:
+            groups[name].append(kind)
+    return "、".join(f"{n}（{'、'.join(k)}）" if k else n for n, k in groups.items())
+
+
+def sources_block(m):
+    def names(xs):
+        return "、".join(xs) if xs else "无"
+    return ("<i>数据来源 · 现货：" + esc(names(m["btc_spot_src"]))
+            + "；合约：" + esc(names(m["btc_perp_src"]))
+            + "；日线：" + esc(names(m["daily_src"]))
+            + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED</i>")
 
 
 def stop_tip(m):
@@ -593,8 +786,9 @@ def build_report(key, reasons, m, warns, now, errors, title="市场天气早报"
         stop_tip(m) or "",
         "📖 <b>今日一课</b>\n" + LESSONS[now.timetuple().tm_yday % len(LESSONS)],
     ]
+    parts.append(sources_block(m))
     if errors:
-        parts.append("<i>部分数据暂时拿不到：" + esc("、".join(e.split(":")[0] for e in errors)) + "</i>")
+        parts.append("<i>这次没拿到：" + esc(failed_summary(errors)) + "</i>")
     parts.append(DISCLAIMER)
     return "\n\n".join(p for p in parts if p)
 
