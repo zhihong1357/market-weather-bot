@@ -10,6 +10,7 @@
 仅用于学习理解市场，不构成投资建议。
 """
 import json
+import math
 import os
 import sys
 import time
@@ -38,11 +39,12 @@ T = {
     "btc_burst_move": 6,    # 24h 涨或跌超 6%：爆发期
     # --- 趋势强度 ADX ---
     "adx_no_trend": 20,     # < 20：基本没有趋势（来回震荡）
-    "adx_quiet_max": 25,    # 静默期要求 ADX < 25
+    "adx_quiet_max": 20,    # 静默期要求 ADX < 20
     # --- 成交量 ---
     "volume_quiet_ratio": 0.9,  # 近 5 天成交量 / 近 30 天平均 < 0.9：成交冷清
     # --- 美股恐慌指数 VIX ---
     "vix_quiet": 20,
+    "vix_quiet_days": 10,   # 静默期要求 VIX 连续 10 个交易日都低于 20
     "vix_warn": 25,
     "vix_burst": 30,
     "vix_crash": 40,
@@ -59,8 +61,9 @@ T = {
     "stable_in_pct": 2.0,       # 7 天增加超过 2%：新资金在进场
     "dxy_jump_pct": 1.5,        # 美元指数 5 个交易日上涨 ≥ 1.5%：美元走强，压制风险资产
     "us10y_jump": 0.25,         # 10 年期美债收益率 5 个交易日上升 ≥ 0.25 个百分点
+    "put_oi_jump_pct": 50,      # BTC 现价下方 2–8% 的看跌期权持仓 7 天增加 ≥ 50%：大资金在买下跌保护
     "move_high_pct": 90,        # 债市恐慌 MOVE 处于 1 年 90% 分位以上
-    "vix_low_pct": 50,          # 同时 VIX 在 1 年 50% 分位以下 → 股债"时差"
+    "vix_low_pct": 50,          # 同时纳指恐慌 VXN（拿不到就用 VIX）在 1 年 50% 分位以下 → 股债"时差"
 }
 
 UA = {"User-Agent": "Mozilla/5.0 (market-weather-bot)"}
@@ -385,6 +388,22 @@ def fetch_dvol(hours=8 * 24):
     return {"now": closes[-1], "d1": ago(24), "d7": closes[0]}
 
 
+def fetch_btc_options():
+    """Deribit 全部 BTC 期权的持仓量（以 BTC 计）和隐含波动率。Deribit 占 BTC 期权的大头。"""
+    rows = get_json(f"{DERIBIT}/get_book_summary_by_currency", {"currency": "BTC", "kind": "option"})["result"]
+    out = []
+    for r in rows:
+        try:
+            _, exp, strike, typ = r["instrument_name"].split("-")  # 例如 BTC-25OCT26-80000-P
+            expiry = datetime.strptime(exp, "%d%b%y").replace(hour=8, tzinfo=timezone.utc)  # 到期时间 08:00 UTC
+        except ValueError:
+            continue
+        out.append({"strike": float(strike), "put": typ == "P", "expiry": expiry.timestamp(),
+                    "oi": r.get("open_interest") or 0.0, "iv": r.get("mark_iv"),
+                    "underlying": r.get("underlying_price")})
+    return out
+
+
 def fetch_fng():
     d = get_json("https://api.alternative.me/fng/", {"limit": 1})["data"][0]
     return int(d["value"])
@@ -567,11 +586,14 @@ def fetch_all():
     data["stable"] = safe(fetch_stablecoins, label="DefiLlama稳定币", errors=errors)
     data["dxy"] = safe(fetch_fred_dated, "DTWEXBGS", label="美元指数(FRED)", errors=errors)
     data["us10y"] = safe(fetch_fred_dated, "DGS10", label="美债10年(FRED)", errors=errors)
+    data["options"] = safe(fetch_btc_options, label="Deribit期权", errors=errors)
     data["dvol"] = safe(fetch_dvol, label="DVOL", errors=errors)
     data["fng"] = safe(fetch_fng, label="恐惧贪婪", errors=errors)
     data["vix_series"] = (safe(fetch_yahoo_closes, "^VIX", label="VIX(Yahoo)", errors=errors)
                           or safe(fetch_fred, "VIXCLS", label="VIX(FRED)", errors=errors))
     data["move_series"] = safe(fetch_yahoo_closes, "^MOVE", label="MOVE", errors=errors)
+    data["vxn_series"] = (safe(fetch_yahoo_closes, "^VXN", label="VXN(Yahoo)", errors=errors)
+                          or safe(fetch_fred, "VXNCLS", label="VXN(FRED)", errors=errors))
     data["ndx_series"] = (safe(fetch_yahoo_closes, "^NDX", label="纳指(Yahoo)", errors=errors)
                           or safe(fetch_fred, "NASDAQ100", label="纳指(FRED)", errors=errors))
     return data
@@ -666,6 +688,66 @@ def liquidation_metrics(m, data, state):
     m["liq_note"] = "，".join(notes)
 
 
+def bs_gamma(S, K, t, iv):
+    """Black-Scholes 的 Gamma（利率按 0）：价格每变动 1 美元，期权 Delta 变多少。"""
+    sd = iv * math.sqrt(t)
+    d1 = (math.log(S / K) + 0.5 * sd * sd) / sd
+    return math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) / (S * sd)
+
+
+def dealer_gex(opts, S, now):
+    """做市商 Gamma 敞口（美元 / 每 1% 价格波动），常用简化假设：
+    看涨期权多是客户卖给做市商（做市商持有 → 正 Gamma），看跌期权多是客户向做市商买（做市商卖出 → 负 Gamma）。"""
+    total = 0.0
+    for o in opts:
+        t = (o["expiry"] - now) / (365 * 86400)
+        if o["oi"] <= 0 or not o["iv"] or t <= 0:
+            continue
+        g = bs_gamma(S, o["strike"], max(t, 1 / 8760), o["iv"] / 100)
+        total += (-1 if o["put"] else 1) * o["oi"] * g * S * S * 0.01
+    return total
+
+
+def options_metrics(m, data, state):
+    opts = data.get("options")
+    for key in ("put_oi", "put_oi_chg7", "put_oi_days", "pcr", "gex", "gamma_flip"):
+        m[key] = None
+    if not opts:
+        return
+    S = m["btc_price"] or median(o["underlying"] for o in opts)
+    if not S:
+        return
+    now = time.time()
+
+    # 看跌保护：30 天内到期、行权价在现价下方 2%–8% 的看跌期权持仓（BTC）
+    m["put_oi"] = sum(o["oi"] for o in opts if o["put"] and 0.92 * S <= o["strike"] <= 0.98 * S
+                      and 0 < o["expiry"] - now <= 30 * 86400)
+    calls = sum(o["oi"] for o in opts if not o["put"])
+    m["pcr"] = sum(o["oi"] for o in opts if o["put"]) / calls if calls else None
+    hist = state.get("put_oi_hist", [])
+    hist.append([int(now), m["put_oi"]])
+    hist = [x for x in hist if now - x[0] <= 8 * 86400]
+    state["put_oi_hist"] = hist
+    m["put_oi_days"] = (now - hist[0][0]) / 86400
+    old = [x for x in hist if now - x[0] >= 6.5 * 86400]
+    if old and old[-1][1]:
+        m["put_oi_chg7"] = (m["put_oi"] / old[-1][1] - 1) * 100
+
+    # 做市商 Gamma：现价处的敞口，以及往上下 15% 内找 Gamma 由正转负的“翻转价”
+    m["gex"] = dealer_gex(opts, S, now)
+    best = None
+    prev_x, prev_g = None, None
+    for i in range(-30, 31):
+        x = S * (1 + i * 0.005)
+        g = dealer_gex(opts, x, now)
+        if prev_g is not None and (prev_g < 0) != (g < 0):
+            flip = (prev_x + x) / 2
+            if best is None or abs(flip - S) < abs(best - S):
+                best = flip
+        prev_x, prev_g = x, g
+    m["gamma_flip"] = best
+
+
 def market_wide_metrics(m, data, state):
     cz = data.get("cz")
     now_ts = int(time.time())
@@ -724,6 +806,7 @@ def compute_metrics(data, state):
         m[f"{k}_perp_src"] = list(p)
 
     m["adx"] = m["atr"] = m["atr_pct"] = m["vol_ratio"] = None
+    m["vol_low_5d"] = False
     m["daily_src"] = daily["sources"] if daily else []
     if daily and len(daily["close"]) > 40:
         # combine_daily 已经去掉了今天还没走完的那根 K 线
@@ -736,6 +819,8 @@ def compute_metrics(data, state):
             avg30 = sum(v[-30:]) / 30
             avg5 = sum(v[-5:]) / 5
             m["vol_ratio"] = avg5 / avg30 if avg30 else None
+            # 最近 5 天是不是每一天都低于 30 天平均
+            m["vol_low_5d"] = all(x < avg30 for x in v[-5:])
 
     m["dvol"] = dvol and dvol["now"]
     m["dvol_d1"] = dvol and dvol["d1"]
@@ -745,10 +830,22 @@ def compute_metrics(data, state):
     m["fng"] = data.get("fng")
     liquidation_metrics(m, data, state)
     market_wide_metrics(m, data, state)
+    options_metrics(m, data, state)
 
     vs = data.get("vix_series")
     m["vix"] = vs[-1] if vs else None
+    m["vix_calm_days"] = None  # VIX 连续多少个交易日低于 20
+    if vs:
+        n = 0
+        for v in reversed(vs):
+            if v >= T["vix_quiet"]:
+                break
+            n += 1
+        m["vix_calm_days"] = n
     m["vix_pct"] = percentile_rank(vs, m["vix"]) if vs else None
+    xs = data.get("vxn_series")
+    m["vxn"] = xs[-1] if xs else None
+    m["vxn_pct"] = percentile_rank(xs, m["vxn"]) if xs else None
     ms = data.get("move_series")
     m["move"] = ms[-1] if ms else None
     m["move_pct"] = percentile_rank(ms, m["move"]) if ms else None
@@ -824,12 +921,14 @@ def classify(m):
         return "fading", r
 
     # 5. 静默
+    vix_calm = m["vix_calm_days"] is None or m["vix_calm_days"] >= T["vix_quiet_days"]
     if (lt(dvol, T["dvol_quiet"]) and lt(adx, T["adx_quiet_max"])
-            and lt(m["vol_ratio"], T["volume_quiet_ratio"])
-            and (vix is None or vix < T["vix_quiet"])):
+            and lt(m["vol_ratio"], T["volume_quiet_ratio"]) and m["vol_low_5d"] and vix_calm):
         r.append(f"DVOL 低（{dvol:.0f}）")
-        r.append(f"成交量只有平时的 {m['vol_ratio'] * 100:.0f}%")
+        r.append(f"成交量连续 5 天低于平时，只有平时的 {m['vol_ratio'] * 100:.0f}%")
         r.append(f"ADX {adx:.0f}，没有明显行情")
+        if m["vix_calm_days"] is not None:
+            r.append(f"VIX 已连续 {m['vix_calm_days']} 个交易日低于 {T['vix_quiet']}")
         return "quiet", r
 
     # 6. 其他情况：平稳
@@ -887,8 +986,14 @@ def radar(m, today):
     oi_chg = m["btc_all_oi_chg"] if m["btc_all_oi_chg"] is not None else m["oi_chg"]
     if gte(oi_chg, T["oi_jump_pct"]) and m["btc_chg24"] is not None and abs(m["btc_chg24"]) < 2:
         w.append(f"⚡ 持仓量 24 小时增加 {oi_chg:.0f}% 但价格几乎没动：大量新杠杆在堆积，后面容易出现大波动。")
-    if gte(m["move_pct"], T["move_high_pct"]) and m["vix_pct"] is not None and m["vix_pct"] <= T["vix_low_pct"]:
-        w.append(f"⏳ 股债时差：债市恐慌 MOVE 在一年 {m['move_pct']:.0f}% 分位，美股 VIX 只在 {m['vix_pct']:.0f}% 分位。"
+    if gte(m["put_oi_chg7"], T["put_oi_jump_pct"]):
+        w.append(f"🛡 BTC 现价下方 2–8% 的看跌期权持仓 7 天增加 {m['put_oi_chg7']:.0f}%：大资金在悄悄买下跌保护，要提高警惕。")
+    if m["gex"] is not None and m["gex"] < 0:
+        w.append("⚙️ 做市商处于负 Gamma（放大器档，估算）：涨跌容易被对冲盘放大，固定窄止损容易被瞬间扫掉，"
+                 "宜减仓、按波动放宽止损或观望。")
+    eq_name, eq_pct = ("纳指 VXN", m["vxn_pct"]) if m["vxn_pct"] is not None else ("美股 VIX", m["vix_pct"])
+    if gte(m["move_pct"], T["move_high_pct"]) and eq_pct is not None and eq_pct <= T["vix_low_pct"]:
+        w.append(f"⏳ 股债时差：债市恐慌 MOVE 在一年 {m['move_pct']:.0f}% 分位，{eq_name} 只在 {eq_pct:.0f}% 分位。"
                  "债市已经紧张、股市还平静，风险可能还没完全反映出来。")
     if m["vix"] is not None and T["vix_warn"] <= m["vix"] < T["vix_burst"]:
         w.append(f"🇺🇸 美股恐慌指数 VIX 升到 {m['vix']:.0f}：美股紧张时，币市常被一起拖累。")
@@ -1001,6 +1106,24 @@ def readings_block(m):
     if m["btc_liq_long"] is not None and m["liq_note"]:
         L.append(f"<i>自采爆仓：{m['liq_note']}</i>")
 
+    if m["gex"] is not None:
+        L += ["", "🎛 <b>期权与做市商</b>（BTC，Deribit）"]
+        gear = "正 Gamma · 减震器档" if m["gex"] >= 0 else "负 Gamma · 放大器档"
+        flip = f"，翻转价约 {fmt_money(m['gamma_flip'])}" if m["gamma_flip"] else ""
+        L.append(f"做市商（估算）：{gear}（每 1% 波动对冲约 {fmt_musd(abs(m['gex']))}{flip}）")
+        if m["gamma_flip"] and m["btc_price"]:
+            gap = (m["btc_price"] / m["gamma_flip"] - 1) * 100
+            if abs(gap) <= 3:
+                L.append(f"<i>离翻转价只有 {abs(gap):.1f}%：" + ("跌破后会切到放大器档，波动可能突然变大</i>" if gap > 0
+                         else "涨回上方后会切回减震器档，波动会变小</i>"))
+        if m["put_oi_chg7"] is not None:
+            chg = f"7 天 {fmt_pct(m['put_oi_chg7'], 0)}"
+        else:
+            chg = f"7 天变化还在累计，已有 {m['put_oi_days']:.0f} 天"
+        L.append(f"下跌保护：现价下方 2–8% 的看跌持仓 {m['put_oi']:,.0f} BTC（30 天内到期，{chg}）")
+        if m["pcr"] is not None:
+            L.append(f"看跌 / 看涨持仓比：{m['pcr']:.2f}" + ("（看跌偏多）" if m["pcr"] >= 1 else ""))
+
     macro = []
     if m["total_mcap"] is not None:
         macro.append(f"加密总市值：{fmt_busd(m['total_mcap'])}（24h {fmt_pct(m['mcap_chg24'])}）"
@@ -1009,7 +1132,11 @@ def readings_block(m):
         macro.append(f"稳定币总量：{fmt_busd(m['stable'])}（7 天 {fmt_pct(m['stable_chg7'])}，"
                      f"30 天 {fmt_pct(m['stable_chg30'])}）")
     if m["vix"] is not None:
-        macro.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}）")
+        calm = (f"，已连续 {m['vix_calm_days']} 天低于 {T['vix_quiet']}"
+                if m["vix_calm_days"] else "")
+        macro.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}{calm}）")
+    if m["vxn"] is not None:
+        macro.append(f"纳指恐慌 VXN：{m['vxn']:.1f}（一年内 {m['vxn_pct']:.0f}% 分位）")
     if m["ndx_chg"] is not None:
         macro.append(f"纳斯达克 100：上个交易日 {fmt_pct(m['ndx_chg'])}")
     if m["move_pct"] is not None:
@@ -1046,6 +1173,7 @@ def sources_block(m):
             + ("；大交易所持仓/爆仓：Coinalyze（" + esc("、".join(m["btc_all_ex"])) + "）" if m["btc_all_oi"] is not None else "")
             + ("；总市值：CoinGecko" if m["total_mcap"] is not None else "")
             + ("；稳定币：DefiLlama" if m["stable"] is not None else "")
+            + ("；期权：Deribit" if m["gex"] is not None else "")
             + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED；美元/美债：FRED</i>")
 
 
@@ -1059,7 +1187,16 @@ def stop_tip(m):
     return ("🎯 <b>止损小提醒</b>\n"
             f"BTC 一天平均波动约 {fmt_money(atr)}（{m['atr_pct']:.1f}%）。\n"
             f"附近的整数关口是 {fmt_money(below)} 和 {fmt_money(above)}，很多人的止损会挤在这些位置附近，别跟大家挤在一起。\n"
-            "如果你的止损距离比一天的正常波动还小，就很容易被扫掉——这时应该减小仓位或杠杆，而不是把止损缩得更窄。")
+            "如果你的止损距离比一天的正常波动还小，就很容易被扫掉——这时应该减小仓位或杠杆，而不是把止损缩得更窄。"
+            + gamma_tip(m))
+
+
+def gamma_tip(m):
+    if m["gex"] is None:
+        return ""
+    if m["gex"] >= 0:
+        return "\n现在做市商偏正 Gamma（减震器档，估算）：价格容易被拉回区间，止损可以适中。"
+    return "\n现在做市商偏负 Gamma（放大器档，估算）：容易单边追涨杀跌，止损要按波动放宽，或者先离场观望。"
 
 
 def state_block(key):
