@@ -54,6 +54,11 @@ T = {
     "oi_jump_pct": 10,          # 24h 持仓量增加 ≥ 10% 但价格几乎没动
     "liq_big_usd": 50e6,        # BTC+ETH 24h 爆仓（只含 OKX、Gate 两家）≥ 5000 万美元：大规模清算
     "liq_one_side_pct": 75,     # 其中一边占 ≥ 75%：集中清算某一方
+    "liq_big_usd_all": 300e6,   # 有 6 大交易所汇总（Coinalyze）时，BTC+ETH 24h 爆仓 ≥ 3 亿美元算大规模清算
+    "stable_out_pct": -1.0,     # 稳定币总量 7 天减少超过 1%：资金在离场
+    "stable_in_pct": 2.0,       # 7 天增加超过 2%：新资金在进场
+    "dxy_jump_pct": 1.5,        # 美元指数 5 个交易日上涨 ≥ 1.5%：美元走强，压制风险资产
+    "us10y_jump": 0.25,         # 10 年期美债收益率 5 个交易日上升 ≥ 0.25 个百分点
     "move_high_pct": 90,        # 债市恐慌 MOVE 处于 1 年 90% 分位以上
     "vix_low_pct": 50,          # 同时 VIX 在 1 年 50% 分位以下 → 股债"时差"
 }
@@ -135,14 +140,17 @@ def now_local():
     return datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_OFFSET_HOURS)
 
 
-def get_json(url, params=None, timeout=20, tries=2):
+def get_json(url, params=None, timeout=20, tries=2, headers=None):
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, headers=UA, timeout=timeout)
+            r = requests.get(url, params=params, headers=dict(UA, **(headers or {})), timeout=timeout)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429 and i + 1 < tries:
+                time.sleep(min(float(e.response.headers.get("Retry-After") or 10), 65))  # 请求太频繁：等一下再试
+                continue
             if e.response is not None and 400 <= e.response.status_code < 500:
                 raise  # 地区限制 / 参数错误，重试也没用
             last = e
@@ -167,6 +175,12 @@ def fmt_musd(x):
     if x is None:
         return "—"
     return f"${x / 1e6:,.1f}M" if x >= 1e6 else f"${x / 1e3:,.0f}K"
+
+
+def fmt_busd(x):
+    if x is None:
+        return "—"
+    return f"${x / 1e12:,.2f}T" if x >= 1e12 else f"${x / 1e9:,.1f}B"
 
 
 def fmt_pct(x, digits=1, sign=True):
@@ -390,19 +404,100 @@ def fetch_yahoo_closes(symbol):
     return None
 
 
-def fetch_fred(series):
-    # 美联储圣路易斯分行 FRED 的官方收盘数据，作为 Yahoo 拿不到时的第二来源
+def fetch_fred_dated(series):
+    """美联储圣路易斯分行 FRED 的官方数据，返回 [(日期, 数值)]（空值的日子跳过）。"""
     r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv",
                      params={"id": series}, headers=UA, timeout=20)
     r.raise_for_status()
-    vals = []
+    rows = []
     for line in r.text.strip().splitlines()[1:]:
         parts = line.split(",")
         try:
-            vals.append(float(parts[1]))
+            rows.append((parts[0], float(parts[1])))
         except (ValueError, IndexError):
             pass
-    return vals[-260:] if vals else None
+    return rows[-260:] if rows else None
+
+
+def fetch_fred(series):
+    # 作为 Yahoo 拿不到时的第二来源
+    rows = fetch_fred_dated(series)
+    return [v for _, v in rows] if rows else None
+
+
+# ---------- 全市场汇总（第三方，免费 API） ----------
+COINALYZE_KEY = os.environ.get("COINALYZE_API_KEY", "").strip()
+COINGECKO_KEY = os.environ.get("COINGECKO_API_KEY", "").strip()
+CZ = "https://api.coinalyze.net/v1"
+# Coinalyze 的交易所代码 → 名字
+CZ_EXCHANGES = {"A": "Binance", "6": "Bybit", "3": "OKX", "2": "Deribit", "H": "Hyperliquid", "Y": "Gate"}
+# 只取这 6 家大交易所的 BTC / ETH 主力永续合约。免费额度按合约个数计，
+# 每次运行约 30 个，不超过每分钟 40 个的上限
+CZ_SYMBOLS = {
+    "BTC": ["BTCUSDT_PERP.A", "BTCUSD_PERP.A", "BTCUSDT.6", "BTCUSDT_PERP.3", "BTC-PERPETUAL.2", "BTC.H",
+            "BTC_USDT.Y"],
+    "ETH": ["ETHUSDT_PERP.A", "ETHUSD_PERP.A", "ETHUSDT.6", "ETHUSDT_PERP.3", "ETH-PERPETUAL.2", "ETH.H",
+            "ETH_USDT.Y"],
+}
+
+
+def cz_get(path, params=None):
+    return get_json(f"{CZ}/{path}", params, headers={"api_key": COINALYZE_KEY})
+
+
+def fetch_coinalyze():
+    """6 家大交易所（Coinalyze 汇总）：各合约持仓量、24h 多空爆仓，以及 Binance / Bybit 的资金费率。"""
+    if not COINALYZE_KEY:
+        raise RuntimeError("没有设置 COINALYZE_API_KEY")
+    coin_of = {sym: c for c, syms in CZ_SYMBOLS.items() for sym in syms}
+    syms = ",".join(coin_of)
+    now = int(time.time())
+    out = {c: {"oi_by_sym": {}, "liq_long": 0.0, "liq_short": 0.0, "exchanges": set()} for c in COINS}
+
+    oi_now = {r["symbol"]: r["value"] for r in cz_get("open-interest", {"symbols": syms, "convert_to_usd": "true"})}
+    for sym, v in oi_now.items():
+        c = coin_of[sym]
+        out[c]["oi_by_sym"][sym] = v
+        out[c]["exchanges"].add(CZ_EXCHANGES[sym.rsplit(".", 1)[1]])
+
+    for r in cz_get("liquidation-history", {"symbols": syms, "interval": "1hour", "from": now - 24 * 3600,
+                                            "to": now, "convert_to_usd": "true"}):
+        c = coin_of[r["symbol"]]
+        for x in r.get("history", []):
+            out[c]["liq_long"] += x["l"]
+            out[c]["liq_short"] += x["s"]
+
+    # Binance、Bybit 的资金费率（GitHub 服务器直连不了这两家，经 Coinalyze 取）
+    # Coinalyze 给的数字单位是 %，这两家的 BTC / ETH USDT 永续都是每 8 小时结算
+    perp = {}
+    fr_syms = {"BTCUSDT_PERP.A": ("BTC", "Binance"), "ETHUSDT_PERP.A": ("ETH", "Binance"),
+               "BTCUSDT.6": ("BTC", "Bybit"), "ETHUSDT.6": ("ETH", "Bybit")}
+    for r in cz_get("funding-rate", {"symbols": ",".join(fr_syms)}):
+        c, ex = fr_syms[r["symbol"]]
+        perp.setdefault(c, {})[ex] = {"funding_8h": r["value"] / 100, "oi_usd": oi_now.get(r["symbol"])}
+    for c in COINS:
+        out[c]["exchanges"] = sorted(out[c]["exchanges"])
+    out["perp"] = perp
+    return out
+
+
+def fetch_coingecko_global():
+    if not COINGECKO_KEY:
+        raise RuntimeError("没有设置 COINGECKO_API_KEY")
+    d = get_json("https://api.coingecko.com/api/v3/global", headers={"x-cg-demo-api-key": COINGECKO_KEY})["data"]
+    pct = d["market_cap_percentage"]
+    return {"total_mcap": d["total_market_cap"]["usd"],
+            "mcap_chg24": d.get("market_cap_change_percentage_24h_usd"),
+            "btc_dom": pct.get("btc"), "eth_dom": pct.get("eth"),
+            "stable_dom": (pct.get("usdt") or 0) + (pct.get("usdc") or 0)}
+
+
+def fetch_stablecoins():
+    # DefiLlama：所有美元稳定币的流通总量（每天一个数）
+    rows = get_json("https://stablecoins.llama.fi/stablecoincharts/all")
+    vals = [(int(r["date"]), r["totalCirculatingUSD"]["peggedUSD"]) for r in rows
+            if r.get("totalCirculatingUSD", {}).get("peggedUSD")]
+    return vals[-40:]
 
 
 # ---------- 爆仓（强平） ----------
@@ -464,6 +559,14 @@ def fetch_all():
     data["daily"] = combine_daily(collect(DAILY_SOURCES, "日线", errors))
     data["liq_gate"] = {c: safe(liq_gate, c, label=f"Gate {c}爆仓", errors=errors) for c in COINS}
     data["liq_okx"] = {c: safe(liq_okx_events, c, label=f"OKX {c}爆仓", errors=errors) for c in COINS}
+    data["cz"] = safe(fetch_coinalyze, label="Coinalyze", errors=errors)
+    if data["cz"]:
+        for c in COINS:
+            data["perp"][c].update(data["cz"]["perp"].get(c, {}))
+    data["cg"] = safe(fetch_coingecko_global, label="CoinGecko", errors=errors)
+    data["stable"] = safe(fetch_stablecoins, label="DefiLlama稳定币", errors=errors)
+    data["dxy"] = safe(fetch_fred_dated, "DTWEXBGS", label="美元指数(FRED)", errors=errors)
+    data["us10y"] = safe(fetch_fred_dated, "DGS10", label="美债10年(FRED)", errors=errors)
     data["dvol"] = safe(fetch_dvol, label="DVOL", errors=errors)
     data["fng"] = safe(fetch_fng, label="恐惧贪婪", errors=errors)
     data["vix_series"] = (safe(fetch_yahoo_closes, "^VIX", label="VIX(Yahoo)", errors=errors)
@@ -555,12 +658,52 @@ def liquidation_metrics(m, data, state):
         m[f"{k}_liq_short"] = short if src else None
         m[f"{k}_liq_src"] = src
         if "OKX" in src:
-            hours = (now_ms - okx["since"][c]) / 3.6e6
+            hours = max(now_ms - okx["since"][c], 0) / 3.6e6
             if hours < 23:
                 notes.append(f"OKX {c} 才累计了 {hours:.0f} 小时")
             elif now_ms - okx["gap_ts"].get(c, 0) <= 24 * 3600 * 1000:
                 notes.append(f"OKX {c} 近 24h 爆仓太密集，可能有漏记")
     m["liq_note"] = "，".join(notes)
+
+
+def market_wide_metrics(m, data, state):
+    cz = data.get("cz")
+    now_ts = int(time.time())
+    hist = state.get("cz_oi_history", [])
+    old = [x for x in hist if now_ts - x[0] >= 20 * 3600]
+    for c in COINS:
+        k = c.lower()
+        x = cz and cz.get(c)
+        oi = x["oi_by_sym"] if x else {}
+        m[f"{k}_all_oi"] = sum(oi.values()) if oi else None
+        # 24h 持仓变化：和 bot 自己约 24 小时前记下的数比，只比较两次都有数据的合约
+        m[f"{k}_all_oi_chg"] = None
+        if oi and old:
+            base = old[-1][1]
+            common = [s for s in oi if base.get(s)]
+            if common:
+                m[f"{k}_all_oi_chg"] = (sum(oi[s] for s in common) / sum(base[s] for s in common) - 1) * 100
+        m[f"{k}_all_liq_long"] = x["liq_long"] if x else None
+        m[f"{k}_all_liq_short"] = x["liq_short"] if x else None
+        m[f"{k}_all_ex"] = x["exchanges"] if x else []
+    if cz:
+        hist.append([now_ts, {s: v for c in COINS for s, v in cz[c]["oi_by_sym"].items()}])
+    state["cz_oi_history"] = [x for x in hist if now_ts - x[0] <= 48 * 3600]
+    cg = data.get("cg") or {}
+    for key in ("total_mcap", "mcap_chg24", "btc_dom", "eth_dom", "stable_dom"):
+        m[key] = cg.get(key)
+    st = data.get("stable")
+    m["stable"] = st[-1][1] if st else None
+    m["stable_chg7"] = (st[-1][1] / st[-8][1] - 1) * 100 if st and len(st) >= 8 else None
+    m["stable_chg30"] = (st[-1][1] / st[-31][1] - 1) * 100 if st and len(st) >= 31 else None
+    for key in ("dxy", "us10y"):
+        rows = data.get(key)
+        m[key] = rows[-1][1] if rows else None
+        m[key + "_date"] = rows[-1][0][5:] if rows else None
+        m[key + "_chg5"] = None
+        if rows and len(rows) >= 6:
+            m[key + "_chg5"] = ((rows[-1][1] / rows[-6][1] - 1) * 100 if key == "dxy"
+                                else rows[-1][1] - rows[-6][1])
 
 
 def compute_metrics(data, state):
@@ -601,6 +744,7 @@ def compute_metrics(data, state):
 
     m["fng"] = data.get("fng")
     liquidation_metrics(m, data, state)
+    market_wide_metrics(m, data, state)
 
     vs = data.get("vix_series")
     m["vix"] = vs[-1] if vs else None
@@ -740,8 +884,9 @@ def radar(m, today):
         w.append(f"🤑 恐惧贪婪指数 {fng}（极度贪婪）：大家都很兴奋，追高要特别小心。")
     elif fng is not None and fng <= T["fng_fear"]:
         w.append(f"😱 恐惧贪婪指数 {fng}（极度恐慌）：情绪极端，常接近转折，但别一次性重仓抄底。")
-    if gte(m["oi_chg"], T["oi_jump_pct"]) and m["btc_chg24"] is not None and abs(m["btc_chg24"]) < 2:
-        w.append(f"⚡ 持仓量 24 小时增加 {m['oi_chg']:.0f}% 但价格几乎没动：大量新杠杆在堆积，后面容易出现大波动。")
+    oi_chg = m["btc_all_oi_chg"] if m["btc_all_oi_chg"] is not None else m["oi_chg"]
+    if gte(oi_chg, T["oi_jump_pct"]) and m["btc_chg24"] is not None and abs(m["btc_chg24"]) < 2:
+        w.append(f"⚡ 持仓量 24 小时增加 {oi_chg:.0f}% 但价格几乎没动：大量新杠杆在堆积，后面容易出现大波动。")
     if gte(m["move_pct"], T["move_high_pct"]) and m["vix_pct"] is not None and m["vix_pct"] <= T["vix_low_pct"]:
         w.append(f"⏳ 股债时差：债市恐慌 MOVE 在一年 {m['move_pct']:.0f}% 分位，美股 VIX 只在 {m['vix_pct']:.0f}% 分位。"
                  "债市已经紧张、股市还平静，风险可能还没完全反映出来。")
@@ -749,17 +894,34 @@ def radar(m, today):
         w.append(f"🇺🇸 美股恐慌指数 VIX 升到 {m['vix']:.0f}：美股紧张时，币市常被一起拖累。")
     if gte(m["dvol_jump"], 10) and not gte(m["dvol_jump"], T["dvol_jump_pct"]):
         w.append(f"📈 DVOL 24 小时上升 {m['dvol_jump']:.0f}%：市场正在变紧张。")
-    if m["btc_liq_long"] is not None:
+    if m["btc_all_liq_long"] is not None:  # 优先用 6 大交易所的汇总数据
+        ln = m["btc_all_liq_long"] + (m["eth_all_liq_long"] or 0)
+        sh = m["btc_all_liq_short"] + (m["eth_all_liq_short"] or 0)
+        big, where = T["liq_big_usd_all"], f"{len(m['btc_all_ex'])} 大交易所合计"
+    elif m["btc_liq_long"] is not None:
         ln = m["btc_liq_long"] + (m["eth_liq_long"] or 0)
         sh = m["btc_liq_short"] + (m["eth_liq_short"] or 0)
-        tot = ln + sh
-        if tot >= T["liq_big_usd"]:
-            side = ""
-            if ln / tot * 100 >= T["liq_one_side_pct"]:
-                side = f"其中多单占 {ln / tot * 100:.0f}%，做多的人被集中清算。"
-            elif sh / tot * 100 >= T["liq_one_side_pct"]:
-                side = f"其中空单占 {sh / tot * 100:.0f}%，做空的人被集中清算（轧空）。"
-            w.append(f"💥 24h BTC+ETH 爆仓 {fmt_musd(tot)}（OKX、Gate 两家）：大规模强平，杠杆正在被清洗。" + side)
+        big, where = T["liq_big_usd"], "只含 OKX、Gate 两家"
+    else:
+        ln = sh = 0.0
+        big, where = float("inf"), ""
+    tot = ln + sh
+    if tot >= big:
+        side = ""
+        if ln / tot * 100 >= T["liq_one_side_pct"]:
+            side = f"其中多单占 {ln / tot * 100:.0f}%，做多的人被集中清算。"
+        elif sh / tot * 100 >= T["liq_one_side_pct"]:
+            side = f"其中空单占 {sh / tot * 100:.0f}%，做空的人被集中清算（轧空）。"
+        w.append(f"💥 24h BTC+ETH 爆仓 {fmt_musd(tot)}（{where}）：大规模强平，杠杆正在被清洗。" + side)
+    if m["stable_chg7"] is not None:
+        if m["stable_chg7"] <= T["stable_out_pct"]:
+            w.append(f"🏦 稳定币总量 7 天减少 {abs(m['stable_chg7']):.1f}%：场外资金在离场，市场的“弹药”变少。")
+        elif m["stable_chg7"] >= T["stable_in_pct"]:
+            w.append(f"🏦 稳定币总量 7 天增加 {m['stable_chg7']:.1f}%：有新资金在进场。")
+    if gte(m["dxy_chg5"], T["dxy_jump_pct"]):
+        w.append(f"💵 美元指数 5 个交易日上涨 {m['dxy_chg5']:.1f}%：美元走强时，币和美股这类风险资产常受压制。")
+    if gte(m["us10y_chg5"], T["us10y_jump"]):
+        w.append(f"📉 10 年期美债收益率 5 个交易日上升 {m['us10y_chg5']:.2f} 个百分点：利率快速上升，对风险资产不友好。")
     w.extend(expiry_warnings(today))
     return w
 
@@ -803,6 +965,15 @@ def readings_block(m):
                  f"· {len(m[k + '_spot_src'])} 家现货中位数")
     if m["dvol"] is not None:
         L.append(f"币市恐慌度 DVOL：{m['dvol']:.0f}（{lvl_dvol(m['dvol'])}）")
+    if m["fng"] is not None:
+        L.append(f"恐惧贪婪指数：{m['fng']}（{lvl_fng(m['fng'])}）")
+    if m["adx"] is not None:
+        L.append(f"趋势强度 ADX：{m['adx']:.0f}（{lvl_adx(m['adx'])}）")
+    if m["vol_ratio"] is not None:
+        L.append(f"近 5 天现货成交量：平时的 {m['vol_ratio'] * 100:.0f}%（{len(m['daily_src'])} 家合计）")
+
+    L.append("")
+    L.append("🧨 <b>杠杆与爆仓</b>")
     for c in COINS:
         k = c.lower()
         if m[k + "_funding"] is not None:
@@ -811,26 +982,45 @@ def readings_block(m):
                      f"{m[k + '_funding_max'] * 100:.4f}%")
     for c in COINS:
         k = c.lower()
-        if m[k + "_liq_long"] is not None:
-            L.append(f"{c} 24h 爆仓：多单 {fmt_musd(m[k + '_liq_long'])} / 空单 {fmt_musd(m[k + '_liq_short'])}"
-                     f"（{'、'.join(m[k + '_liq_src'])}）")
-    if m["btc_liq_long"] is not None and m["liq_note"]:
-        L.append(f"<i>爆仓只含 OKX、Gate（不含 Binance、Bybit），{m['liq_note']}</i>")
-    if m["btc_oi"] is not None:
-        L.append(f"BTC 合约持仓：${m['btc_oi'] / 1e9:.1f}B（{len(m['btc_oi_by_ex'])} 家合计）"
+        if m[k + "_all_oi"] is not None:
+            L.append(f"{c} 合约持仓：{fmt_busd(m[k + '_all_oi'])}（{len(m[k + '_all_ex'])} 大交易所"
+                     + (f"，24h {fmt_pct(m[k + '_all_oi_chg'])}" if m[k + "_all_oi_chg"] is not None else "") + "）")
+    if m["btc_all_oi"] is None and m["btc_oi"] is not None:
+        L.append(f"BTC 合约持仓：{fmt_busd(m['btc_oi'])}（{len(m['btc_oi_by_ex'])} 家合计）"
                  + (f"，24h {fmt_pct(m['oi_chg'])}" if m["oi_chg"] is not None else ""))
-    if m["fng"] is not None:
-        L.append(f"恐惧贪婪指数：{m['fng']}（{lvl_fng(m['fng'])}）")
-    if m["adx"] is not None:
-        L.append(f"趋势强度 ADX：{m['adx']:.0f}（{lvl_adx(m['adx'])}）")
-    if m["vol_ratio"] is not None:
-        L.append(f"近 5 天现货成交量：平时的 {m['vol_ratio'] * 100:.0f}%（{len(m['daily_src'])} 家合计）")
+    for c in COINS:
+        k = c.lower()
+        parts = []
+        if m[k + "_all_liq_long"] is not None:
+            parts.append(f"多单 {fmt_musd(m[k + '_all_liq_long'])} / 空单 {fmt_musd(m[k + '_all_liq_short'])}（{len(m[k + '_all_ex'])} 大交易所）")
+        if m[k + "_liq_long"] is not None:
+            parts.append(f"自采 {'+'.join(m[k + '_liq_src'])}：多 {fmt_musd(m[k + '_liq_long'])} / "
+                         f"空 {fmt_musd(m[k + '_liq_short'])}")
+        if parts:
+            L.append(f"{c} 24h 爆仓：" + " · ".join(parts))
+    if m["btc_liq_long"] is not None and m["liq_note"]:
+        L.append(f"<i>自采爆仓：{m['liq_note']}</i>")
+
+    macro = []
+    if m["total_mcap"] is not None:
+        macro.append(f"加密总市值：{fmt_busd(m['total_mcap'])}（24h {fmt_pct(m['mcap_chg24'])}）"
+                     f"· BTC 占 {m['btc_dom']:.1f}%，稳定币占 {m['stable_dom']:.1f}%")
+    if m["stable"] is not None:
+        macro.append(f"稳定币总量：{fmt_busd(m['stable'])}（7 天 {fmt_pct(m['stable_chg7'])}，"
+                     f"30 天 {fmt_pct(m['stable_chg30'])}）")
     if m["vix"] is not None:
-        L.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}）")
+        macro.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}）")
     if m["ndx_chg"] is not None:
-        L.append(f"纳斯达克 100：上个交易日 {fmt_pct(m['ndx_chg'])}")
+        macro.append(f"纳斯达克 100：上个交易日 {fmt_pct(m['ndx_chg'])}")
     if m["move_pct"] is not None:
-        L.append(f"债市恐慌 MOVE：一年内 {m['move_pct']:.0f}% 分位")
+        macro.append(f"债市恐慌 MOVE：一年内 {m['move_pct']:.0f}% 分位")
+    if m["dxy"] is not None:
+        macro.append(f"美元指数（广义）：{m['dxy']:.1f}（5 日 {fmt_pct(m['dxy_chg5'])}，{m['dxy_date']}）")
+    if m["us10y"] is not None:
+        chg = f"{m['us10y_chg5']:+.2f}" if m["us10y_chg5"] is not None else "—"
+        macro.append(f"10 年期美债收益率：{m['us10y']:.2f}%（5 日 {chg}，{m['us10y_date']}）")
+    if macro:
+        L += ["", "🌍 <b>宏观与资金</b>"] + macro
     return "\n".join(L)
 
 
@@ -853,7 +1043,10 @@ def sources_block(m):
             + "；合约：" + esc(names(m["btc_perp_src"]))
             + "；日线：" + esc(names(m["daily_src"]))
             + "；爆仓：" + esc(names(m["btc_liq_src"]))
-            + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED</i>")
+            + ("；大交易所持仓/爆仓：Coinalyze（" + esc("、".join(m["btc_all_ex"])) + "）" if m["btc_all_oi"] is not None else "")
+            + ("；总市值：CoinGecko" if m["total_mcap"] is not None else "")
+            + ("；稳定币：DefiLlama" if m["stable"] is not None else "")
+            + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED；美元/美债：FRED</i>")
 
 
 def stop_tip(m):
