@@ -9,8 +9,11 @@
 
 仅用于学习理解市场，不构成投资建议。
 """
+import io
 import json
 import math
+import re
+import zipfile
 import os
 import sys
 import time
@@ -568,6 +571,89 @@ def fetch_cme_basis():
             "name": meta.get("shortName", "")}
 
 
+# ---------- 新闻与情绪（多个独立来源，左右对照） ----------
+GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+
+def gdelt_timeline(query, mode, timespan):
+    """GDELT 全球新闻数据库（免费，每 5 秒最多 1 次请求）：返回 [(时间戳, 数值)]。"""
+    time.sleep(6)
+    d = get_json(GDELT, {"query": query + " sourcelang:english", "mode": mode,
+                         "timespan": timespan, "format": "json"}, timeout=30, tries=1)  # 被限流就算了，不干等
+    out = []
+    for x in d["timeline"][0]["data"]:
+        t = datetime.strptime(x["date"], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+        out.append((t, x["value"]))
+    return out
+
+
+def fetch_news():
+    now = time.time()
+
+    def recent_vs_all(rows, hours=24):
+        last = [v for t, v in rows if now - t <= hours * 3600] or [rows[-1][1]]
+        return sum(last) / len(last), sum(v for _, v in rows) / len(rows)
+    out, last_err = {}, None
+    # GDELT 对共用 IP 限流很严：三个查询分开取，拿到几个算几个
+    try:
+        out["tone"], out["tone_base"] = recent_vs_all(
+            gdelt_timeline('(economy OR "stock market" OR inflation OR "interest rates")', "timelinetone", "14d"))
+    except Exception as e:  # noqa
+        last_err = e
+    try:
+        a, b = recent_vs_all(gdelt_timeline(
+            '(recession OR crisis OR crash OR default OR "bank run" OR war)', "timelinevol", "30d"), 36)
+        out["crisis_ratio"] = a / b if b else None
+    except Exception as e:  # noqa
+        last_err = e
+    try:
+        out["btc_tone"] = recent_vs_all(gdelt_timeline("bitcoin", "timelinetone", "3d"))[0]
+    except Exception as e:  # noqa
+        last_err = e
+    if not out:
+        raise last_err
+    return out
+
+
+def fetch_cnn_fg():
+    d = get_json("https://production.dataviz.cnn.io/index/fearandgreed/graphdata")["fear_and_greed"]
+    return {"score": d["score"], "week": d.get("previous_1_week")}
+
+
+def fetch_sf_news_sentiment():
+    """旧金山联储每日新闻情绪指数（Excel）：取最后两个多月的数据。"""
+    r = requests.get("https://www.frbsf.org/wp-content/uploads/news_sentiment_data.xlsx", headers=UA, timeout=30)
+    r.raise_for_status()
+    sheet = zipfile.ZipFile(io.BytesIO(r.content)).read("xl/worksheets/sheet2.xml").decode()
+    rows = re.findall(r'<c r="A\d+"[^>]*><v>([\d.]+)</v></c><c r="B\d+"[^>]*><v>(-?[\d.Ee-]+)</v></c>', sheet)
+    rows = [(float(a), float(b)) for a, b in rows[-70:]]
+    day0 = datetime(1899, 12, 30)  # Excel 日期从这一天起算
+    return [((day0 + timedelta(days=a)).strftime("%m-%d"), b) for a, b in rows]
+
+
+def fetch_gpr():
+    """地缘政治风险指数（美联储经济学家 Caldara & Iacoviello 每日更新的 Excel）。"""
+    import xlrd
+    r = requests.get("https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.xls", headers=UA, timeout=60)
+    r.raise_for_status()
+    sh = xlrd.open_workbook(file_contents=r.content).sheet_by_index(0)
+    col = sh.row_values(0).index("GPRD_MA7")
+    vals = [v for v in (sh.cell_value(i, col) for i in range(max(1, sh.nrows - 365), sh.nrows)) if isinstance(v, float)]
+    return {"now": vals[-1], "pct": percentile_rank(vals, vals[-1])}
+
+
+def cached(state, name, hours, fn, errors, label):
+    """每天才更新一次的大文件：隔 hours 小时才重新下载，其余时间用上次的结果。"""
+    c = state.setdefault("cache", {}).get(name)
+    if c and time.time() - c["t"] < hours * 3600:
+        return c["v"]
+    v = safe(fn, label=label, errors=errors)
+    if v is not None:
+        state["cache"][name] = {"t": int(time.time()), "v": v}
+        return v
+    return c["v"] if c else None
+
+
 def fetch_coingecko_global():
     if not COINGECKO_KEY:
         raise RuntimeError("没有设置 COINGECKO_API_KEY")
@@ -638,7 +724,7 @@ def collect(sources, kind, errors, *a):
     return out
 
 
-def fetch_all():
+def fetch_all(state):
     errors = []
     data = {"errors": errors}
     data["spot"] = {c: collect(SPOT_SOURCES, f"{c}现货", errors, c) for c in COINS}
@@ -657,6 +743,11 @@ def fetch_all():
     data["epu"] = safe(fetch_fred_dated, "USEPUINDXD", label="政策不确定性(FRED)", errors=errors)
     data["cme_cot"] = safe(fetch_cme_cot, label="CFTC持仓周报", errors=errors)
     data["cme_px"] = safe(fetch_cme_basis, label="CME期货价", errors=errors)
+    data["news"] = cached(state, "gdelt", 2, fetch_news, errors, "GDELT新闻")
+    data["news_age_h"] = (time.time() - state["cache"]["gdelt"]["t"]) / 3600 if state.get("cache", {}).get("gdelt") else None
+    data["cnn_fg"] = safe(fetch_cnn_fg, label="CNN恐惧贪婪", errors=errors)
+    data["sf_sent"] = cached(state, "sf_sent", 12, fetch_sf_news_sentiment, errors, "旧金山联储新闻情绪")
+    data["gpr"] = cached(state, "gpr", 12, fetch_gpr, errors, "地缘政治风险")
     data["flow"] = safe(fetch_flow_imbalance, label="Coinalyze订单流", errors=errors) if COINALYZE_KEY else None
     data["us10y"] = safe(fetch_fred_dated, "DGS10", label="美债10年(FRED)", errors=errors)
     data["options"] = safe(fetch_btc_options, label="Deribit期权", errors=errors)
@@ -882,6 +973,19 @@ def market_wide_metrics(m, data, state):
         m["flow_imb"], m["flow_net"] = window(fl[-24:])
         hist = [window(fl[i - 24:i])[0] for i in range(24, len(fl) + 1)]
         m["flow_imb_pct"] = percentile_rank(hist, m["flow_imb"])
+
+    # 新闻与情绪
+    nw = data.get("news") or {}
+    m["news_age_h"] = data.get("news_age_h")
+    m["news_tone"], m["news_tone_base"] = nw.get("tone"), nw.get("tone_base")
+    m["crisis_ratio"], m["btc_news_tone"] = nw.get("crisis_ratio"), nw.get("btc_tone")
+    cf = data.get("cnn_fg") or {}
+    m["cnn_fg"], m["cnn_fg_week"] = cf.get("score"), cf.get("week")
+    sf = data.get("sf_sent")
+    m["sf_sent"] = sf[-1][1] if sf else None
+    m["sf_sent_date"] = sf[-1][0] if sf else None
+    m["sf_sent_chg"] = sf[-1][1] - sf[-31][1] if sf and len(sf) > 31 else None
+    m["gpr"] = data.get("gpr")
 
     # 信用利差（美国高收益债 OAS）和政策不确定性指数
     hy = data.get("hy")
@@ -1228,131 +1332,357 @@ def lvl_funding(x):
     return "正常"
 
 
+def item(L, name, value, what, now):
+    """一个指标：名字和读数，然后用两句白话说明“它是什么”和“现在意味着什么”。"""
+    L.append(f"▫️ <b>{name}</b>：{value}\n   📖 {what}\n   👉 {now}")
+
+
+def chg_word(x, flat=1.0, big=3.0):
+    if x is None:
+        return ""
+    if abs(x) < flat:
+        return "基本没动"
+    return ("小幅" if abs(x) < big else "明显") + ("上涨" if x > 0 else "下跌")
+
+
 def readings_block(m):
-    L = ["📊 <b>关键读数</b>"]
+    S = []  # 每一段是一个板块
+
+    # ---------- 价格与波动 ----------
+    L = ["📊 <b>价格与波动</b>"]
     for c in COINS:
         k = c.lower()
-        L.append(f"{c} {fmt_money(m[k + '_price'])}（24h {fmt_pct(m[k + '_chg24'])}）"
-                 f"· {len(m[k + '_spot_src'])} 家现货中位数")
+        if m[k + "_price"] is None:
+            continue
+        chg = m[k + "_chg24"]
+        now = f"24 小时{chg_word(chg, 1, 4)}" if chg is not None else "暂时拿不到涨跌"
+        if chg is not None and abs(chg) >= T["btc_burst_move"]:
+            now += "，属于大波动，要提高警惕"
+        item(L, f"{c} 价格", f"{fmt_money(m[k + '_price'])}（24h {fmt_pct(chg)}）",
+             (f"{len(m[k + '_spot_src'])} 家大交易所现货价格的中位数，避免单一交易所失真" if len(m[k + "_spot_src"]) > 1
+              else "这次只拿到 1 家交易所的现货价格"), now)
     if m["dvol"] is not None:
-        L.append(f"币市恐慌度 DVOL：{m['dvol']:.0f}（{lvl_dvol(m['dvol'])}）")
-    if m["fng"] is not None:
-        L.append(f"恐惧贪婪指数：{m['fng']}（{lvl_fng(m['fng'])}）")
-    if m["adx"] is not None:
-        L.append(f"趋势强度 ADX：{m['adx']:.0f}（{lvl_adx(m['adx'])}）")
+        d = m["dvol"]
+        now = {"低": "市场很平静，没人急着买“保险”", "正常": "波动预期正常",
+               "偏高": "市场开始紧张，大家在花钱买保护", "很高": "市场很恐慌，随时可能大幅波动"}[lvl_dvol(d)]
+        if gte(m["dvol_jump"], 10):
+            now += f"；而且 24 小时内升了 {m['dvol_jump']:.0f}%，紧张在升温"
+        item(L, "币市恐慌度 DVOL", f"{d:.0f}（{lvl_dvol(d)}）",
+             "BTC 期权价格反推出的“未来 30 天预期波动”，相当于币圈的 VIX。45 以下平静，70 以上紧张", now)
     if m["rv7"] is not None:
-        L.append(f"BTC 实现波动率（年化）：7 天 {m['rv7']:.0f}% / 30 天 {m['rv30']:.0f}%")
+        r = m["rv7"] / m["rv30"] if m["rv30"] else 1
+        now = ("最近一周的实际波动明显比一个月平均大，波动在放大" if r >= 1.3 else
+               "最近一周比一个月平均安静，波动在收敛" if r <= 0.75 else "最近一周和一个月平均差不多，波动平稳")
+        item(L, "BTC 实际波动率", f"7 天 {m['rv7']:.0f}% / 30 天 {m['rv30']:.0f}%（年化）",
+             "价格过去真实涨跌的剧烈程度。短期突然比长期大很多时，量化基金的风控会逼它们减仓", now)
+    if m["adx"] is not None:
+        a = m["adx"]
+        now = ("没有方向，来回震荡，追涨杀跌容易两头挨打" if a < 20 else
+               "趋势很弱，方向还不明确" if a < 25 else "有一定趋势，顺着方向做胜算较高" if a < 40 else
+               "趋势很强，别逆着做")
+        item(L, "趋势强度 ADX", f"{a:.0f}（{lvl_adx(a)}）", "只看“有没有方向”，不看涨跌。20 以下算没趋势，25 以上算有趋势", now)
     if m["vol_ratio"] is not None:
-        L.append(f"近 5 天现货成交量：平时的 {m['vol_ratio'] * 100:.0f}%（{len(m['daily_src'])} 家合计）")
+        v = m["vol_ratio"]
+        now = ("成交冷清，大家在观望" + ("，而且已经连续 5 天偏低" if m["vol_low_5d"] else "") if v < 0.9 else
+               "成交正常" if v < 1.3 else "明显放量，有资金在大举进出")
+        item(L, "现货成交量", f"近 5 天是平时的 {v * 100:.0f}%",
+             f"{len(m['daily_src'])} 家大交易所的现货成交量合计，和过去 30 天平均比较", now)
+    if m["fng"] is not None:
+        f = m["fng"]
+        now = ("极度恐慌：情绪极端，常接近转折，但别一次性重仓抄底" if f <= 20 else
+               "偏恐慌：大家比较悲观" if f < 45 else "情绪中性" if f <= 55 else
+               "偏贪婪：大家比较乐观，追高要小心" if f < 80 else "极度贪婪：过热了，最容易在这时候被套")
+        item(L, "币圈恐惧贪婪指数", f"{f}（{lvl_fng(f)}）", "综合波动、成交、社交热度等算出的币圈情绪，0 最恐慌、100 最贪婪", now)
+    S.append("\n".join(L))
 
-    L.append("")
-    L.append("🧨 <b>杠杆与爆仓</b>")
+    # ---------- 杠杆与爆仓 ----------
+    L = ["🧨 <b>杠杆与爆仓</b>"]
     for c in COINS:
         k = c.lower()
-        if m[k + "_funding"] is not None:
-            L.append(f"{c} 资金费率：{m[k + '_funding'] * 100:.4f}%/8h（{lvl_funding(m[k + '_funding'])}）"
-                     f"· {m[k + '_funding_n']} 家{m[k + '_funding_how']}，各家 {m[k + '_funding_min'] * 100:.4f}% ~ "
-                     f"{m[k + '_funding_max'] * 100:.4f}%")
+        fr = m[k + "_funding"]
+        if fr is None:
+            continue
+        lv = lvl_funding(fr)
+        now = {"正常": "多空力量比较平衡",
+               "多头过挤": "做多的人太多，市场反而容易往下插针，扫掉多头的止损",
+               "空头过挤": "做空的人太多，容易突然暴拉“轧空”"}[lv]
+        if lv == "正常":
+            now += "，" + ("略偏多头" if fr > 0.0001 else "略偏空头" if fr < 0 else "没有明显拥挤")
+        item(L, f"{c} 资金费率", f"{fr * 100:.4f}%/8h（{lv}）",
+             "永续合约里多空双方互相支付的费用，正数是多头付钱给空头。"
+             + (f"{m[k + '_funding_n']} 家交易所{m[k + '_funding_how']}，各家从 {m[k + '_funding_min'] * 100:.4f}% "
+                f"到 {m[k + '_funding_max'] * 100:.4f}%" if m[k + "_funding_n"] > 1 else "这次只拿到 1 家交易所"), now)
+    oi_chg = m["btc_all_oi_chg"] if m["btc_all_oi_chg"] is not None else m["oi_chg"]
+    oi_val = m["btc_all_oi"] if m["btc_all_oi"] is not None else m["btc_oi"]
+    if oi_val is not None:
+        src = (f"{len(m['btc_all_ex'])} 大交易所" if m["btc_all_oi"] is not None else f"{len(m['btc_oi_by_ex'])} 家")
+        if oi_chg is None:
+            now = "24 小时变化还在累计（bot 每小时记录一次）"
+        elif oi_chg >= T["oi_jump_pct"] and m["btc_chg24"] is not None and abs(m["btc_chg24"]) < 2:
+            now = "持仓大增但价格没怎么动：新杠杆在堆积，后面容易出现大波动"
+        elif oi_chg >= 3:
+            now = "有新资金带着杠杆进场" + ("，跟着价格一起涨，趋势有人推" if (m["btc_chg24"] or 0) > 1 else "")
+        elif oi_chg <= -3:
+            now = "杠杆在退场（主动平仓或被爆仓），市场在“去杠杆”"
+        else:
+            now = "杠杆水平变化不大"
+        item(L, "BTC 合约持仓", f"{fmt_busd(oi_val)}（{src}" + (f"，24h {fmt_pct(oi_chg)}）" if oi_chg is not None else "）"),
+             "所有还没平仓的 BTC 合约总价值，代表市场里杠杆有多少", now)
     for c in COINS:
         k = c.lower()
-        if m[k + "_all_oi"] is not None:
-            L.append(f"{c} 合约持仓：{fmt_busd(m[k + '_all_oi'])}（{len(m[k + '_all_ex'])} 大交易所"
-                     + (f"，24h {fmt_pct(m[k + '_all_oi_chg'])}" if m[k + "_all_oi_chg"] is not None else "") + "）")
-    if m["btc_all_oi"] is None and m["btc_oi"] is not None:
-        L.append(f"BTC 合约持仓：{fmt_busd(m['btc_oi'])}（{len(m['btc_oi_by_ex'])} 家合计）"
-                 + (f"，24h {fmt_pct(m['oi_chg'])}" if m["oi_chg"] is not None else ""))
-    for c in COINS:
-        k = c.lower()
-        parts = []
-        if m[k + "_all_liq_long"] is not None:
-            parts.append(f"多单 {fmt_musd(m[k + '_all_liq_long'])} / 空单 {fmt_musd(m[k + '_all_liq_short'])}（{len(m[k + '_all_ex'])} 大交易所）")
-        if m[k + "_liq_long"] is not None:
-            parts.append(f"自采 {'+'.join(m[k + '_liq_src'])}：多 {fmt_musd(m[k + '_liq_long'])} / "
-                         f"空 {fmt_musd(m[k + '_liq_short'])}")
-        if parts:
-            L.append(f"{c} 24h 爆仓：" + " · ".join(parts))
+        ln, sh = m[k + "_all_liq_long"], m[k + "_all_liq_short"]
+        where = f"{len(m[k + '_all_ex'])} 大交易所"
+        if ln is None:
+            ln, sh, where = m[k + "_liq_long"], m[k + "_liq_short"], "+".join(m[k + "_liq_src"]) or "—"
+        if ln is None:
+            continue
+        tot = ln + sh
+        now = ("几乎没有爆仓，市场很安静" if tot < 5e6 else
+               "多单爆得多：价格下跌时做多的人被强制平仓" if ln > sh * 2 else
+               "空单爆得多：价格上涨时做空的人被强制平仓" if sh > ln * 2 else "多空两边都有爆仓，来回扫")
+        item(L, f"{c} 24h 爆仓", f"多单 {fmt_musd(ln)} / 空单 {fmt_musd(sh)}（{where}）",
+             "杠杆仓位亏到保证金不够、被交易所强制平仓的金额", now)
     if m["btc_liq_long"] is not None and m["liq_note"]:
-        L.append(f"<i>自采爆仓：{m['liq_note']}</i>")
+        L.append(f"<i>自采爆仓（OKX+Gate）：{m['liq_note']}</i>")
     if m["flow_imb"] is not None:
-        side = "主动卖单占优" if m["flow_net"] < 0 else "主动买单占优"
-        L.append(f"订单流失衡（近似毒性订单流）：{m['flow_imb']:.2f}，{side}（近 7 天 {m['flow_imb_pct']:.0f}% 分位，Binance BTC）")
+        p = m["flow_imb_pct"]
+        side = "卖" if m["flow_net"] < 0 else "买"
+        now = (f"主动{side}单异常集中，做市商可能撤单，留意插针" if p >= T["flow_toxic_pct"] else
+               f"略偏主动{side}，还在正常范围" if p >= 70 else "买卖比较均衡，正常")
+        item(L, "订单流失衡（近似毒性订单流）", f"{m['flow_imb']:.2f}（近 7 天 {p:.0f}% 分位）",
+             "主动买单和主动卖单差多少。越单边，越像有“知情资金”在一边倒地砸或扫（用 Binance BTC 每小时数据近似）", now)
+    S.append("\n".join(L))
 
+    # ---------- 期权与做市商 ----------
     if m["gex"] is not None:
-        L += ["", "🎛 <b>期权与做市商</b>（BTC，Deribit）"]
-        gear = "正 Gamma · 减震器档" if m["gex"] >= 0 else "负 Gamma · 放大器档"
+        L = ["🎛 <b>期权与做市商</b>（BTC，Deribit）"]
+        pos = m["gex"] >= 0
         flip = f"，翻转价约 {fmt_money(m['gamma_flip'])}" if m["gamma_flip"] else ""
-        L.append(f"做市商（估算）：{gear}（每 1% 波动对冲约 {fmt_musd(abs(m['gex']))}{flip}）")
+        now = ("减震器档：做市商会“跌了买、涨了卖”，价格容易被拉回区间" if pos else
+               "放大器档：做市商会“跌了卖、涨了买”，涨跌容易被放大")
         if m["gamma_flip"] and m["btc_price"]:
             gap = (m["btc_price"] / m["gamma_flip"] - 1) * 100
             if abs(gap) <= 3:
-                move = "跌破" if gap > 0 else "涨过"
-                to = "放大器档，波动可能突然变大" if m["gex"] >= 0 else "减震器档，波动会变小"
-                L.append(f"<i>离翻转价只有 {abs(gap):.1f}%：{move}翻转价后会切到{to}</i>")
-        if m["put_oi_chg7"] is not None:
-            chg = f"7 天 {fmt_pct(m['put_oi_chg7'], 0)}"
-        else:
-            chg = f"7 天变化还在累计，已有 {m['put_oi_days']:.0f} 天"
-        L.append(f"下跌保护：现价下方 2–8% 的看跌持仓 {m['put_oi']:,.0f} BTC（30 天内到期，{chg}）")
+                now += (f"。离翻转价只有 {abs(gap):.1f}%，{'跌破' if gap > 0 else '涨过'}后会切到"
+                        + ("放大器档" if pos else "减震器档"))
+        item(L, "做市商 Gamma（估算）", ("正 Gamma" if pos else "负 Gamma") + f"（每 1% 波动对冲约 {fmt_musd(abs(m['gex']))}{flip}）",
+             "做市商为了对冲期权风险，会被迫跟着价格买卖。正 Gamma 时他们帮市场“减震”，负 Gamma 时帮市场“加速”", now)
+        if m["put_oi"] is not None:
+            c7 = m["put_oi_chg7"]
+            now = (f"7 天变化还在累计（已有 {m['put_oi_days']:.0f} 天）" if c7 is None else
+                   "一周暴增，大资金在花钱买下跌保险，要提高警惕" if c7 >= T["put_oi_jump_pct"] else
+                   "一周有增加，防守意愿在上升" if c7 >= 15 else "一周减少，大家没那么担心下跌" if c7 <= -15 else "变化不大")
+            item(L, "下跌保护", f"{m['put_oi']:,.0f} BTC" + (f"（7 天 {fmt_pct(c7, 0)}）" if c7 is not None else ""),
+                 "30 天内到期、行权价在现价下方 2–8% 的看跌期权持仓，相当于大家买的“下跌保险”", now)
         if m["pcr"] is not None:
-            L.append(f"看跌 / 看涨持仓比：{m['pcr']:.2f}" + ("（看跌偏多）" if m["pcr"] >= 1 else ""))
+            p = m["pcr"]
+            now = ("看涨的仓位明显更多，市场偏乐观" if p < 0.7 else "看涨看跌比较平衡" if p < 1 else "看跌仓位更多，市场偏防守")
+            item(L, "看跌 / 看涨持仓比", f"{p:.2f}", "所有看跌期权持仓 ÷ 看涨期权持仓。低于 0.7 偏乐观，高于 1 偏防守", now)
         if m["cliff_pct"] is not None:
             d = m["cliff_date"]
-            L.append(f"对冲断崖：{d.month}月{d.day}日月度到期会带走 {m['cliff_pct']:.0f}% 的期权 Gamma；"
-                     f"24 小时内到期（0DTE）占 {m['gamma_0dte_pct']:.0f}%")
+            days = (d - datetime.now(timezone.utc).date()).days
+            now = (f"{days} 天后这次到期分量很重，到期后减震会明显变弱" if m["cliff_pct"] >= T["cliff_gamma_pct"] and days <= 7 else
+                   "这次到期分量较重，到期前后留意波动" if m["cliff_pct"] >= T["cliff_gamma_pct"] else "到期影响有限")
+            if m["gamma_0dte_pct"] >= 25:
+                now += f"；当天到期的期权占 {m['gamma_0dte_pct']:.0f}%，盘中容易急拉急跌"
+            item(L, "对冲断崖", f"{d.month}月{d.day}日月度到期带走 {m['cliff_pct']:.0f}% 的 Gamma；0DTE 占 {m['gamma_0dte_pct']:.0f}%",
+                 "期权到期后，做市商需要对冲的仓位一下子变少，“减震器”变弱，之后一周左右波动容易被放大", now)
+        S.append("\n".join(L))
 
+    # ---------- CME ----------
     cme = m.get("cme")
     if cme or m.get("cme_basis") is not None:
-        L += ["", "🏛 <b>CME 机构市场</b>（芝商所，受美国监管）"]
+        L = ["🏛 <b>CME 机构市场</b>（芝商所，受美国监管）"]
         if m["cme_basis"] is not None:
-            L.append(f"期货溢价：{fmt_pct(m['cme_basis'], 2)}（{esc(m['cme_name'])}，相对现货）")
+            b = m["cme_basis"]
+            now = ("溢价偏高，机构做多意愿强" if b >= 1 else "小幅溢价，正常" if b >= 0 else "贴水（比现货便宜），机构偏谨慎甚至偏空")
+            item(L, "CME 期货溢价", f"{fmt_pct(b, 2)}（{esc(m['cme_name'])}）",
+                 "CME 比特币期货比现货贵多少。机构越想做多，溢价越高", now)
         if cme:
             n, p = cme["now"], cme["prev"]
-            price = m["btc_price"] or 0
-            opt = (f"，其中期权（Delta 折算）约 {cme['options_oi']:,.0f} BTC"
-                   if cme["options_oi"] is not None else "")
-            L.append(f"持仓：{n['oi']:,.0f} BTC（约 {fmt_busd(n['oi'] * price)}{opt}）· CFTC 周报 {cme['date'][5:]}")
+            am_chg = n["am"] - p["am"] if p else None
+            now = ("还没有上周数据可比较" if am_chg is None else
+                   "传统机构在明显加仓" if gte(m["cme_am_chg"], T["cme_am_chg_pct"]) else
+                   "传统机构在明显减仓" if m["cme_am_chg"] is not None and m["cme_am_chg"] <= -T["cme_am_chg_pct"] else
+                   f"传统机构一周{'小幅加仓' if am_chg >= 0 else '小幅减仓'}，变化不大")
+            item(L, "资产管理机构（养老金、基金等）", f"{'净多' if n['am'] >= 0 else '净空'} {abs(n['am']):,.0f} BTC",
+                 f"CFTC 每周公布的 CME 持仓（数据日 {cme['date'][5:]}）里，传统机构的多空。总持仓 {n['oi']:,.0f} BTC", now)
+            item(L, "杠杆基金（对冲基金）", f"{'净多' if n['lev'] >= 0 else '净空'} {abs(n['lev']):,.0f} BTC",
+                 "对冲基金的多空。它们的净空大多是“买现货 / ETF、空期货”赚价差的套利",
+                 "净空不一定代表看空，主要反映套利规模" if n["lev"] < 0 else "对冲基金整体偏多")
+        S.append("\n".join(L))
 
-            def who(name, key, note=""):
-                side = "净多" if n[key] >= 0 else "净空"
-                chg = ""
-                if p:
-                    d = abs(n[key]) - abs(p[key]) if (n[key] >= 0) == (p[key] >= 0) else None
-                    chg = (f"，一周{'增加' if d >= 0 else '减少'} {abs(d):,.0f}" if d is not None
-                           else "，这周刚由" + ("净空转为净多" if n[key] >= 0 else "净多转为净空"))
-                return f"{name}{side} {abs(n[key]):,.0f} BTC{chg}{note}"
-            L.append(who("资产管理机构", "am"))
-            L.append(who("杠杆基金", "lev", "（多为“买现货/ETF、空期货”的套利，不一定是看空）"))
-
-    macro = []
-    if m["total_mcap"] is not None:
-        macro.append(f"加密总市值：{fmt_busd(m['total_mcap'])}（24h {fmt_pct(m['mcap_chg24'])}）"
-                     f"· BTC 占 {m['btc_dom']:.1f}%，稳定币占 {m['stable_dom']:.1f}%")
-    if m["stable"] is not None:
-        macro.append(f"稳定币总量：{fmt_busd(m['stable'])}（7 天 {fmt_pct(m['stable_chg7'])}，"
-                     f"30 天 {fmt_pct(m['stable_chg30'])}）")
-    if m["vix"] is not None:
-        calm = (f"，已连续 {m['vix_calm_days']} 天低于 {T['vix_quiet']}"
-                if m["vix_calm_days"] else "")
-        macro.append(f"美股恐慌 VIX：{m['vix']:.1f}（{lvl_vix(m['vix'])}{calm}）")
-    if m["vxn"] is not None:
-        macro.append(f"纳指恐慌 VXN：{m['vxn']:.1f}（一年内 {m['vxn_pct']:.0f}% 分位）")
-    if m["ndx_chg"] is not None:
-        macro.append(f"纳斯达克 100：上个交易日 {fmt_pct(m['ndx_chg'])}")
-    if m["move_pct"] is not None:
-        macro.append(f"债市恐慌 MOVE：一年内 {m['move_pct']:.0f}% 分位")
-    if m["hy"] is not None:
-        chg = f"{m['hy_chg5']:+.2f}" if m["hy_chg5"] is not None else "—"
-        macro.append(f"美国高收益债信用利差：{m['hy']:.2f}%（5 日 {chg}，一年内 {m['hy_pct']:.0f}% 分位）")
+    # ---------- 新闻与情绪 ----------
+    L = ["📰 <b>新闻与情绪</b>（多个来源对照）"]
+    if gte(m.get("news_age_h"), 1.5):
+        L.append(f"<i>GDELT 这次限流没取到，下面用的是 {m['news_age_h']:.0f} 小时前的数据</i>")
+    if m.get("cnn_fg") is not None:
+        f = m["cnn_fg"]
+        now = ("美股极度恐慌，资金在避险" if f <= 25 else "美股偏恐慌" if f < 45 else "美股情绪中性" if f <= 55 else
+               "美股偏贪婪" if f < 75 else "美股极度贪婪，过热")
+        if m.get("cnn_fg_week") is not None:
+            now += f"（一周前 {m['cnn_fg_week']:.0f}）"
+        item(L, "美股恐惧贪婪（CNN）", f"{f:.0f}", "CNN 用 7 个美股指标算的情绪，0 最恐慌、100 最贪婪", now)
+    if m.get("news_tone") is not None:
+        t, base = m["news_tone"], m["news_tone_base"]
+        diff = t - base
+        now = ("新闻比平时明显更负面" if diff <= -0.5 else "新闻比平时更正面" if diff >= 0.5 else "新闻语气和平时差不多")
+        item(L, "全球经济新闻语气（GDELT）", f"{t:+.2f}（近 14 天平均 {base:+.2f}）",
+             "全球英文新闻里谈经济、市场的文章，平均语气是偏正面还是偏负面（负数 = 偏负面）", now)
+    if m.get("crisis_ratio") is not None:
+        r = m["crisis_ratio"]
+        now = ("危机类词汇突然暴增（超过平时 1.5 倍），出现了市场没见过的新状况，算法和资金容易先撤退" if r >= 1.5 else
+               "危机类报道比平时多一些" if r >= 1.2 else "危机类报道在正常水平")
+        item(L, "危机新闻热度（GDELT）", f"平时的 {r:.1f} 倍",
+             "“衰退、危机、崩盘、违约”这类词在新闻里出现的频率，和过去 30 天平均比较", now)
+    if m.get("btc_news_tone") is not None:
+        t = m["btc_news_tone"]
+        now = "比特币新闻偏负面" if t <= -1 else "比特币新闻偏正面" if t >= 1 else "比特币新闻语气中性"
+        item(L, "比特币新闻语气（GDELT）", f"{t:+.2f}（近 24 小时）", "全球英文新闻里提到比特币的文章的平均语气", now)
+    if m.get("sf_sent") is not None:
+        v = m["sf_sent"]
+        now = ("经济新闻情绪明显偏悲观" if v <= -0.2 else "经济新闻情绪偏悲观" if v < 0 else "经济新闻情绪偏乐观")
+        if m.get("sf_sent_chg") is not None:
+            now += f"，比一个月前{'改善' if m['sf_sent_chg'] > 0 else '变差'}"
+        item(L, "美国经济新闻情绪（旧金山联储）", f"{v:+.2f}（{m['sf_sent_date']}）",
+             "旧金山联储研究员用经济新闻文章算的每日情绪，0 以上偏乐观、0 以下偏悲观", now)
     if m["epu"] is not None:
-        lvl = "严重" if m["epu"] >= T["epu_crisis"] else "紧张" if m["epu"] >= T["epu_warn"] else "正常"
-        macro.append(f"政策不确定性指数：{m['epu']:.0f}（7 日均值，{lvl}）")
+        e = m["epu"]
+        now = ("严重危机级，市场可能长时间高波动或受压" if e >= T["epu_crisis"] else
+               "明显紧张，新消息容易引发大波动" if e >= T["epu_warn"] else "政策面比较平静")
+        item(L, "美国政策不确定性指数", f"{e:.0f}（7 日均值）",
+             "学术界统计美国报纸里“政策 + 不确定”相关报道的多少。约 100 是长期平均，超过 200 紧张，超过 300 危机", now)
+    if m.get("gpr") is not None:
+        g = m["gpr"]
+        now = ("地缘冲突风险很高" if g["pct"] >= 90 else "地缘风险偏高" if g["pct"] >= 70 else "地缘风险正常")
+        item(L, "地缘政治风险指数", f"{g['now']:.0f}（7 日均值，一年内 {g['pct']:.0f}% 分位）",
+             "美联储经济学家统计战争、恐袭、军事冲突类报道的多少", now)
+    if len(L) > 1:
+        S.append("\n".join(L))
+
+    # ---------- 宏观与资金 ----------
+    L = ["🌍 <b>宏观与资金</b>"]
+    if m["total_mcap"] is not None:
+        d = m["btc_dom"]
+        now = ("资金集中在 BTC，偏防守，山寨币相对弱" if d >= 58 else "资金在往山寨币扩散，风险偏好较高" if d < 50 else "BTC 和山寨币比较均衡")
+        item(L, "加密总市值", f"{fmt_busd(m['total_mcap'])}（24h {fmt_pct(m['mcap_chg24'])}）· BTC 占 {d:.1f}%",
+             "所有加密货币加起来值多少；BTC 占比代表资金是集中在龙头还是分散到小币", now)
+    if m["stable"] is not None:
+        c7 = m["stable_chg7"]
+        now = ("稳定币在减少，场外资金在离场，市场“弹药”变少" if gte(-(c7 or 0), 0.5) else
+               "稳定币在增加，有新资金准备进场" if gte(c7, 0.5) else "稳定币总量平稳，资金没有明显进出")
+        item(L, "稳定币总量", f"{fmt_busd(m['stable'])}（7 天 {fmt_pct(c7)}）",
+             "链上所有美元稳定币的总量，是准备买币的“弹药”", now)
+    if m["vix"] is not None:
+        v = m["vix"]
+        now = ("美股很平静" if v < 15 else "美股正常" if v < 20 else "美股开始紧张" if v < 25 else
+               "美股明显紧张，币市常被拖累" if v < 30 else "美股恐慌" if v < 40 else "美股极度恐慌，接近崩盘级")
+        if m["vix_calm_days"]:
+            now += f"（已连续 {m['vix_calm_days']} 个交易日低于 {T['vix_quiet']}）"
+        item(L, "美股恐慌 VIX", f"{v:.1f}", "标普 500 期权反推的未来 30 天预期波动。20 以下平静，30 以上恐慌，40 以上崩盘级", now)
+    if m["vxn"] is not None:
+        p = m["vxn_pct"]
+        now = "纳指很紧张" if p >= 80 else "纳指偏紧张" if p >= 60 else "纳指平静"
+        item(L, "纳指恐慌 VXN", f"{m['vxn']:.1f}（一年内 {p:.0f}% 分位）", "纳斯达克 100 的“VIX”，和比特币走势关系更密切", now)
+    if m["ndx_chg"] is not None:
+        item(L, "纳斯达克 100", f"上个交易日 {fmt_pct(m['ndx_chg'])}", "美国科技股指数，币市常跟着它走",
+             f"美股科技股{chg_word(m['ndx_chg'], 0.5, 1.5)}")
+    if m["move_pct"] is not None:
+        p = m["move_pct"]
+        now = "债市很紧张（保护很贵）" if p >= 90 else "债市偏紧张" if p >= 70 else "债市平静"
+        item(L, "债市恐慌 MOVE", f"一年内 {p:.0f}% 分位", "美债期权的预期波动，相当于债市的 VIX。风险常常先在债市出现", now)
+    if m["hy"] is not None:
+        p = m["hy_pct"]
+        now = ("信用市场明显紧张，借钱变贵" if p >= 90 else "信用市场偏紧" if p >= 70 else "信用市场平稳")
+        if gte(m["hy_chg5"], 0.2):
+            now += "，而且最近在走阔"
+        item(L, "美国高收益债信用利差", f"{m['hy']:.2f}%（一年内 {p:.0f}% 分位）",
+             "垃圾债比国债多要的利息。越高说明大家越担心企业还不起钱", now)
     if m["dxy"] is not None:
-        macro.append(f"美元指数（广义）：{m['dxy']:.1f}（5 日 {fmt_pct(m['dxy_chg5'])}，{m['dxy_date']}）")
+        c5 = m["dxy_chg5"]
+        now = ("美元在走强，通常压制币和美股" if gte(c5, 0.8) else "美元在走弱，对风险资产有利" if c5 is not None and c5 <= -0.8
+               else "美元平稳")
+        item(L, "美元指数（广义）", f"{m['dxy']:.1f}（5 日 {fmt_pct(c5)}，{m['dxy_date']}）",
+             "美元对一篮子货币的强弱。美元越强，全球资金越紧", now)
     if m["us10y"] is not None:
-        chg = f"{m['us10y_chg5']:+.2f}" if m["us10y_chg5"] is not None else "—"
-        macro.append(f"10 年期美债收益率：{m['us10y']:.2f}%（5 日 {chg}，{m['us10y_date']}）")
-    if macro:
-        L += ["", "🌍 <b>宏观与资金</b>"] + macro
+        c5 = m["us10y_chg5"]
+        now = ("利率在快速上升，对风险资产不友好" if gte(c5, 0.15) else "利率在下降，资金成本变低，对风险资产有利"
+               if c5 is not None and c5 <= -0.15 else "利率平稳")
+        item(L, "10 年期美债收益率", f"{m['us10y']:.2f}%（5 日 {c5:+.2f}，{m['us10y_date']}）" if c5 is not None
+             else f"{m['us10y']:.2f}%", "全球资产定价的“锚”。利率越高，持有不生息的币和成长股越不划算", now)
+    if len(L) > 1:
+        S.append("\n".join(L))
+    return "\n\n".join(S)
+
+
+def summary_block(key, m, warns):
+    """把所有指标归纳成“支撑因素 / 风险因素”，再用几句话说清楚现在该怎么看。"""
+    good, bad = [], []
+
+    def add(cond, lst, text):
+        if cond:
+            lst.append(text)
+
+    f = m["btc_funding"]
+    add(gte(f, T["funding_hot"]), bad, "合约多头拥挤")
+    add(f is not None and f <= T["funding_cold"], good, "空头拥挤，有轧空可能")
+    add(f is not None and T["funding_cold"] < f < T["funding_hot"], good, "杠杆不拥挤")
+    oi_chg = m["btc_all_oi_chg"] if m["btc_all_oi_chg"] is not None else m["oi_chg"]
+    add(gte(oi_chg, T["oi_jump_pct"]), bad, "杠杆在快速堆积")
+    add(m["gex"] is not None and m["gex"] >= 0, good, "做市商在减震")
+    add(m["gex"] is not None and m["gex"] < 0, bad, "做市商在放大波动")
+    add(gte(m["put_oi_chg7"], T["put_oi_jump_pct"]), bad, "大资金在买下跌保险")
+    add(gte(m["cme_basis"], 1), good, "CME 机构做多意愿强")
+    add(m["cme_basis"] is not None and m["cme_basis"] < 0, bad, "CME 期货贴水")
+    add(gte(m["cme_am_chg"], T["cme_am_chg_pct"]), good, "传统机构在加仓")
+    add(m["cme_am_chg"] is not None and m["cme_am_chg"] <= -T["cme_am_chg_pct"], bad, "传统机构在减仓")
+    add(gte(m["stable_chg7"], 0.5), good, "稳定币在流入")
+    add(m["stable_chg7"] is not None and m["stable_chg7"] <= -0.5, bad, "稳定币在流出")
+    add(gte(m["rv7"], T["rv_scale_min"]) and m["rv30"] and m["rv7"] >= m["rv30"] * T["rv_scale_ratio"], bad, "波动在放大")
+    add(gte(m["flow_imb_pct"], T["flow_toxic_pct"]), bad, "订单流异常单边")
+    add(gte(m["move_pct"], T["move_high_pct"]), bad, "债市紧张")
+    add(gte(m["hy_pct"], 80), bad, "信用利差偏高")
+    add(gte(m["vxn_pct"], 80), bad, "纳指紧张")
+    add(m["vix"] is not None and m["vix"] < 20, good, "美股 VIX 平静")
+    add(gte(m["vix"], 25), bad, "美股恐慌升温")
+    add(gte(m["epu"], T["epu_warn"]), bad, "政策不确定性高")
+    add(gte(m["dxy_chg5"], 0.8), bad, "美元走强")
+    add(m["dxy_chg5"] is not None and m["dxy_chg5"] <= -0.8, good, "美元走弱")
+    add(gte(m["us10y_chg5"], 0.15), bad, "利率上升")
+    add(m["us10y_chg5"] is not None and m["us10y_chg5"] <= -0.15, good, "利率下降")
+    add(gte(m.get("crisis_ratio"), 1.5), bad, "危机新闻暴增")
+    add(m.get("cnn_fg") is not None and m["cnn_fg"] <= 25, bad, "美股极度恐慌")
+    add(m["fng"] is not None and m["fng"] >= 80, bad, "币圈过度贪婪")
+    add(m["fng"] is not None and m["fng"] <= 20, good, "币圈极度恐慌（逆向看常接近底部）")
+    add(any(w.startswith("🧱") for w in warns), bad, "处在期权到期后的对冲断崖期")
+
+    # 币市内部 vs 外部宏观，分开说
+    calm = m["dvol"] is not None and m["dvol"] < 50 and not gte(m["rv7"], 50)
+    inside = "币市内部比较平静" if calm else "币市内部波动偏大"
+    if f is not None:
+        inside += "，杠杆" + ("偏热" if gte(f, T["funding_hot"]) else "偏冷" if f <= T["funding_cold"] else "不拥挤")
+    macro_bad = [x for x in bad if x in ("债市紧张", "信用利差偏高", "纳指紧张", "美股恐慌升温", "政策不确定性高",
+                                         "美元走强", "利率上升", "危机新闻暴增", "美股极度恐慌")]
+    outside = ("外部环境平稳" if not macro_bad else
+               f"外部有 {len(macro_bad)} 处紧张信号（{'、'.join(macro_bad)}）" if len(macro_bad) <= 2 else
+               f"外部环境偏紧（{'、'.join(macro_bad)}），币市容易被宏观拖累")
+    score = len(bad) - len(good)
+    tilt = "偏谨慎" if score >= 3 else "偏积极" if score <= -2 else "中性"
+    s = STATES[key]
+    act = s["do"]
+    if tilt == "偏谨慎" and key in ("quiet", "normal"):
+        act += "不过风险因素明显多于支撑因素，仓位宜比平时轻一些，止损按波动放宽。"
+    elif tilt == "偏积极" and key in ("quiet", "normal"):
+        act += "支撑因素占优，可以按计划执行，但仍要守住止损。"
+
+    L = ["📝 <b>小总结</b>",
+         f"今天是 {s['emoji']} {s['name']}。{inside}；{outside}。"]
+    if good:
+        L.append(f"✅ 支撑因素（{len(good)}）：" + "；".join(good))
+    if bad:
+        L.append(f"⚠️ 风险因素（{len(bad)}）：" + "；".join(bad))
+    L.append(f"👉 综合判断：<b>{tilt}</b>。{act}")
+    L.append(f"❌ 别做：{s['dont']}")
     return "\n".join(L)
 
 
@@ -1380,6 +1710,7 @@ def sources_block(m):
             + ("；稳定币：DefiLlama" if m["stable"] is not None else "")
             + ("；期权：Deribit" if m["gex"] is not None else "")
             + ("；CME：CFTC 持仓周报 / Yahoo" if m.get("cme") or m.get("cme_basis") is not None else "")
+            + "；新闻：GDELT / 旧金山联储 / 地缘风险指数 / CNN"
             + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED；美元/美债/信用利差/政策不确定性：FRED</i>")
 
 
@@ -1428,6 +1759,7 @@ def build_report(key, reasons, m, warns, now, errors, title="市场天气早报"
         readings_block(m),
         radar_block(warns),
         stop_tip(m) or "",
+        summary_block(key, m, warns),
         "📖 <b>今日一课</b>\n" + LESSONS[now.timetuple().tm_yday % len(LESSONS)],
     ]
     parts.append(sources_block(m))
@@ -1480,8 +1812,25 @@ def send(token, chat_id, text, dry_run=False):
         print(text)
         print("=" * 50)
         return
-    tg_api(token, "sendMessage", {"chat_id": chat_id, "text": text,
-                                  "parse_mode": "HTML", "disable_web_page_preview": True})
+    for part in split_message(text):
+        tg_api(token, "sendMessage", {"chat_id": chat_id, "text": part,
+                                      "parse_mode": "HTML", "disable_web_page_preview": True})
+        time.sleep(1)
+
+
+def split_message(text, limit=3900):
+    """Telegram 一条消息最多 4096 字：按板块（空行）切成几条，板块太长再按行切。"""
+    parts, cur = [], ""
+    for block in text.split("\n\n"):
+        pieces = [block] if len(block) <= limit else block.split("\n")
+        for p in pieces:
+            if cur and len(cur) + len(p) + 2 > limit:
+                parts.append(cur)
+                cur = ""
+            cur = f"{cur}\n\n{p}" if cur else p
+    if cur:
+        parts.append(cur)
+    return parts
 
 
 # ============================================================
@@ -1535,7 +1884,7 @@ def main():
             now = datetime.fromisoformat(mock_now)
             today = now.date().isoformat()
     else:
-        data = fetch_all()
+        data = fetch_all(state)
 
     m = compute_metrics(data, state)
     if m["btc_price"] is None and m["dvol"] is None:
