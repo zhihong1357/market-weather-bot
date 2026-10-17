@@ -224,20 +224,13 @@ def spot_okx(coin):
     return {"price": last, "chg24": (last / op - 1) * 100 if op else None}
 
 
-def spot_bybit(coin):
-    d = get_json("https://api.bybit.com/v5/market/tickers",
-                 {"category": "spot", "symbol": f"{coin}USDT"})["result"]["list"][0]
-    p = num(d.get("price24hPcnt"))
-    return {"price": num(d["lastPrice"]), "chg24": p * 100 if p is not None else None}
-
-
 def spot_binance(coin):
     d = get_json("https://data-api.binance.vision/api/v3/ticker/24hr", {"symbol": f"{coin}USDT"})
     return {"price": num(d["lastPrice"]), "chg24": num(d["priceChangePercent"])}
 
 
 SPOT_SOURCES = {"Coinbase": spot_coinbase, "Kraken": spot_kraken, "Bitstamp": spot_bitstamp,
-                "OKX": spot_okx, "Bybit": spot_bybit, "Binance": spot_binance}
+                "OKX": spot_okx, "Binance": spot_binance}
 
 
 # ---------- 永续合约：资金费率（统一换算成每 8 小时）+ 持仓量（美元） ----------
@@ -256,27 +249,23 @@ def perp_okx(coin):
     return {"funding_8h": num(fr["fundingRate"]) * 8 / hours, "oi_usd": num(oi.get("oiUsd"))}
 
 
-def perp_bybit(coin):
-    sym = f"{coin}USDT"
-    t = get_json("https://api.bybit.com/v5/market/tickers",
-                 {"category": "linear", "symbol": sym})["result"]["list"][0]
-    info = get_json("https://api.bybit.com/v5/market/instruments-info",
-                    {"category": "linear", "symbol": sym})["result"]["list"][0]
-    hours = int(info.get("fundingInterval") or 480) / 60
-    return {"funding_8h": num(t["fundingRate"]) * 8 / hours, "oi_usd": num(t.get("openInterestValue"))}
+def perp_bitget(coin):
+    q = {"symbol": f"{coin}USDT", "productType": "usdt-futures"}
+    t = get_json("https://api.bitget.com/api/v2/mix/market/ticker", q)["data"][0]
+    fr = get_json("https://api.bitget.com/api/v2/mix/market/current-fund-rate", q)["data"][0]
+    hours = int(fr.get("fundingRateInterval") or 8)
+    # 持仓量以币计，按标记价格换算成美元
+    return {"funding_8h": num(t["fundingRate"]) * 8 / hours,
+            "oi_usd": num(t["holdingAmount"]) * num(t["markPrice"])}
 
 
-def perp_binance(coin):
-    sym = f"{coin}USDT"
-    p = get_json("https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": sym})
-    hours = 8
-    for x in get_json("https://fapi.binance.com/fapi/v1/fundingInfo"):
-        if x.get("symbol") == sym:
-            hours = int(x["fundingIntervalHours"])
-    oi = get_json("https://fapi.binance.com/futures/data/openInterestHist",
-                  {"symbol": sym, "period": "5m", "limit": 1})
-    return {"funding_8h": num(p["lastFundingRate"]) * 8 / hours,
-            "oi_usd": num(oi[-1]["sumOpenInterestValue"]) if oi else None}
+def perp_gate(coin):
+    c = get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{coin}_USDT")
+    st = get_json("https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                  {"contract": f"{coin}_USDT", "interval": "5m", "limit": 1})
+    hours = int(c.get("funding_interval") or 28800) / 3600
+    return {"funding_8h": num(c["funding_rate"]) * 8 / hours,
+            "oi_usd": num(st[-1]["open_interest_usd"]) if st else None}
 
 
 def perp_hyperliquid(coin):
@@ -291,7 +280,8 @@ def perp_hyperliquid(coin):
     raise KeyError(coin)
 
 
-PERP_SOURCES = {"Binance": perp_binance, "Bybit": perp_bybit, "OKX": perp_okx,
+# Binance 合约、Bybit 会拒绝来自 GitHub 美国服务器的请求，所以这里不用它们
+PERP_SOURCES = {"OKX": perp_okx, "Bitget": perp_bitget, "Gate": perp_gate,
                 "Deribit": perp_deribit, "Hyperliquid": perp_hyperliquid}
 
 
@@ -322,12 +312,6 @@ def daily_okx():
     return {int(r[0]) // 1000: (num(r[2]), num(r[3]), num(r[4]), num(r[5])) for r in rows}
 
 
-def daily_bybit():
-    rows = get_json("https://api.bybit.com/v5/market/kline",
-                    {"category": "spot", "symbol": "BTCUSDT", "interval": "D", "limit": 120})["result"]["list"]
-    return {int(r[0]) // 1000: (num(r[2]), num(r[3]), num(r[4]), num(r[5])) for r in rows}
-
-
 def daily_binance():
     rows = get_json("https://data-api.binance.vision/api/v3/klines",
                     {"symbol": "BTCUSDT", "interval": "1d", "limit": 120})
@@ -335,7 +319,7 @@ def daily_binance():
 
 
 DAILY_SOURCES = {"Coinbase": daily_coinbase, "Kraken": daily_kraken, "Bitstamp": daily_bitstamp,
-                 "OKX": daily_okx, "Bybit": daily_bybit, "Binance": daily_binance}
+                 "OKX": daily_okx, "Binance": daily_binance}
 
 
 def combine_daily(per_ex):
