@@ -1,1 +1,12 @@
-{}
+{
+  "chat_id": "1134208027",
+  "oi_history": [
+    [
+      1792263652,
+      837618970
+    ]
+  ],
+  "last_state": "normal",
+  "last_run": "2026-10-18T03:00+00:00",
+  "last_candidate": "normal"
+}
