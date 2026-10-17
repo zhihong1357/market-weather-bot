@@ -52,6 +52,8 @@ T = {
     "fng_greed": 80,
     "fng_fear": 20,
     "oi_jump_pct": 10,          # 24h 持仓量增加 ≥ 10% 但价格几乎没动
+    "liq_big_usd": 50e6,        # BTC+ETH 24h 爆仓（只含 OKX、Gate 两家）≥ 5000 万美元：大规模清算
+    "liq_one_side_pct": 75,     # 其中一边占 ≥ 75%：集中清算某一方
     "move_high_pct": 90,        # 债市恐慌 MOVE 处于 1 年 90% 分位以上
     "vix_low_pct": 50,          # 同时 VIX 在 1 年 50% 分位以下 → 股债"时差"
 }
@@ -159,6 +161,12 @@ def fmt_money(x, digits=0):
     if x is None:
         return "—"
     return f"${x:,.{digits}f}"
+
+
+def fmt_musd(x):
+    if x is None:
+        return "—"
+    return f"${x / 1e6:,.1f}M" if x >= 1e6 else f"${x / 1e3:,.0f}K"
 
 
 def fmt_pct(x, digits=1, sign=True):
@@ -397,6 +405,38 @@ def fetch_fred(series):
     return vals[-260:] if vals else None
 
 
+# ---------- 爆仓（强平） ----------
+# Binance、Bybit 拒绝 GitHub 美国服务器，Bitget 没有公开爆仓接口，所以只用这两家：
+#   Gate：交易所直接公布每小时的多单 / 空单爆仓金额（美元），取最近 24 小时
+#   OKX：只公布最近一百多条爆仓单，bot 每小时运行时把新出现的爆仓单累计记下来
+def liq_gate(coin):
+    rows = get_json("https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                    {"contract": f"{coin}_USDT", "interval": "1h", "limit": 24})
+    return {"long": sum(num(r["long_liq_usd"]) for r in rows),
+            "short": sum(num(r["short_liq_usd"]) for r in rows), "hours": len(rows)}
+
+
+def liq_okx_events(coin, pages=10):
+    """返回 [(时间戳毫秒, "long"/"short", 美元)]，从新到旧。"""
+    inst = get_json("https://www.okx.com/api/v5/public/instruments",
+                    {"instType": "SWAP", "instId": f"{coin}-USDT-SWAP"})["data"][0]
+    ct_val = num(inst["ctVal"])  # 每张合约是多少个币
+    out, after = [], None
+    for _ in range(pages):
+        q = {"instType": "SWAP", "uly": f"{coin}-USDT", "state": "filled", "limit": 100}
+        if after:
+            q["after"] = after
+        data = get_json("https://www.okx.com/api/v5/public/liquidation-orders", q)["data"]
+        rows = data[0]["details"] if data else []
+        for r in rows:
+            long_ = r["posSide"] == "long" or (r["posSide"] == "net" and r["side"] == "sell")
+            out.append((int(r["ts"]), "long" if long_ else "short", num(r["sz"]) * ct_val * num(r["bkPx"])))
+        if len(rows) < 100:
+            break
+        after = rows[-1]["ts"]
+    return out
+
+
 def safe(fn, *a, label="", errors=None):
     try:
         return fn(*a)
@@ -422,6 +462,8 @@ def fetch_all():
     data["spot"] = {c: collect(SPOT_SOURCES, f"{c}现货", errors, c) for c in COINS}
     data["perp"] = {c: collect(PERP_SOURCES, f"{c}合约", errors, c) for c in COINS}
     data["daily"] = combine_daily(collect(DAILY_SOURCES, "日线", errors))
+    data["liq_gate"] = {c: safe(liq_gate, c, label=f"Gate {c}爆仓", errors=errors) for c in COINS}
+    data["liq_okx"] = {c: safe(liq_okx_events, c, label=f"OKX {c}爆仓", errors=errors) for c in COINS}
     data["dvol"] = safe(fetch_dvol, label="DVOL", errors=errors)
     data["fng"] = safe(fetch_fng, label="恐惧贪婪", errors=errors)
     data["vix_series"] = (safe(fetch_yahoo_closes, "^VIX", label="VIX(Yahoo)", errors=errors)
@@ -475,6 +517,52 @@ def funding_summary(perps):
     return avg, min(rates.values()), max(rates.values()), len(rates), how
 
 
+def liquidation_metrics(m, data, state):
+    """24h 多单 / 空单爆仓金额：Gate 用交易所公布的小时数据；OKX 用 bot 自己累计的记录。"""
+    now_ms = int(time.time() * 1000)
+    okx = state.setdefault("okx_liq", {"since": {}, "last_ts": {}, "rows": [], "gap_ts": {}})
+    for c in COINS:
+        events = data.get("liq_okx", {}).get(c)
+        if events is None:
+            continue
+        # 第一次拿到这个币的数据：从 OKX 返回的最早一条爆仓单开始算覆盖时间
+        okx["since"].setdefault(c, min((e[0] for e in events), default=now_ms))
+        last = okx["last_ts"].get(c, 0)
+        new = [e for e in events if e[0] > last]
+        if new:
+            okx["last_ts"][c] = max(e[0] for e in new)
+        okx["rows"] += [[e[0], c, e[1], round(e[2], 2)] for e in new]
+        # 这次拿到的最早一条也比上次记录的新：和上次没有衔接上，中间可能漏记
+        if last and events and min(e[0] for e in events) > last:
+            okx["gap_ts"][c] = now_ms
+    okx["rows"] = [r for r in okx["rows"] if now_ms - r[0] <= 24 * 3600 * 1000]
+    notes = []
+
+    for c in COINS:
+        k = c.lower()
+        long_ = short = 0.0
+        src = []
+        g = data.get("liq_gate", {}).get(c)
+        if g:
+            long_ += g["long"]
+            short += g["short"]
+            src.append("Gate")
+        if data.get("liq_okx", {}).get(c) is not None:
+            long_ += sum(r[3] for r in okx["rows"] if r[1] == c and r[2] == "long")
+            short += sum(r[3] for r in okx["rows"] if r[1] == c and r[2] == "short")
+            src.append("OKX")
+        m[f"{k}_liq_long"] = long_ if src else None
+        m[f"{k}_liq_short"] = short if src else None
+        m[f"{k}_liq_src"] = src
+        if "OKX" in src:
+            hours = (now_ms - okx["since"][c]) / 3.6e6
+            if hours < 23:
+                notes.append(f"OKX {c} 才累计了 {hours:.0f} 小时")
+            elif now_ms - okx["gap_ts"].get(c, 0) <= 24 * 3600 * 1000:
+                notes.append(f"OKX {c} 近 24h 爆仓太密集，可能有漏记")
+    m["liq_note"] = "，".join(notes)
+
+
 def compute_metrics(data, state):
     m = {"errors": data.get("errors", [])}
     spot, perp, daily, dvol = data.get("spot", {}), data.get("perp", {}), data.get("daily"), data.get("dvol")
@@ -512,6 +600,7 @@ def compute_metrics(data, state):
     m["dvol_jump"] = ((dvol["now"] / dvol["d1"] - 1) * 100) if dvol and dvol["d1"] else None
 
     m["fng"] = data.get("fng")
+    liquidation_metrics(m, data, state)
 
     vs = data.get("vix_series")
     m["vix"] = vs[-1] if vs else None
@@ -660,6 +749,17 @@ def radar(m, today):
         w.append(f"🇺🇸 美股恐慌指数 VIX 升到 {m['vix']:.0f}：美股紧张时，币市常被一起拖累。")
     if gte(m["dvol_jump"], 10) and not gte(m["dvol_jump"], T["dvol_jump_pct"]):
         w.append(f"📈 DVOL 24 小时上升 {m['dvol_jump']:.0f}%：市场正在变紧张。")
+    if m["btc_liq_long"] is not None:
+        ln = m["btc_liq_long"] + (m["eth_liq_long"] or 0)
+        sh = m["btc_liq_short"] + (m["eth_liq_short"] or 0)
+        tot = ln + sh
+        if tot >= T["liq_big_usd"]:
+            side = ""
+            if ln / tot * 100 >= T["liq_one_side_pct"]:
+                side = f"其中多单占 {ln / tot * 100:.0f}%，做多的人被集中清算。"
+            elif sh / tot * 100 >= T["liq_one_side_pct"]:
+                side = f"其中空单占 {sh / tot * 100:.0f}%，做空的人被集中清算（轧空）。"
+            w.append(f"💥 24h BTC+ETH 爆仓 {fmt_musd(tot)}（OKX、Gate 两家）：大规模强平，杠杆正在被清洗。" + side)
     w.extend(expiry_warnings(today))
     return w
 
@@ -709,6 +809,13 @@ def readings_block(m):
             L.append(f"{c} 资金费率：{m[k + '_funding'] * 100:.4f}%/8h（{lvl_funding(m[k + '_funding'])}）"
                      f"· {m[k + '_funding_n']} 家{m[k + '_funding_how']}，各家 {m[k + '_funding_min'] * 100:.4f}% ~ "
                      f"{m[k + '_funding_max'] * 100:.4f}%")
+    for c in COINS:
+        k = c.lower()
+        if m[k + "_liq_long"] is not None:
+            L.append(f"{c} 24h 爆仓：多单 {fmt_musd(m[k + '_liq_long'])} / 空单 {fmt_musd(m[k + '_liq_short'])}"
+                     f"（{'、'.join(m[k + '_liq_src'])}）")
+    if m["btc_liq_long"] is not None and m["liq_note"]:
+        L.append(f"<i>爆仓只含 OKX、Gate（不含 Binance、Bybit），{m['liq_note']}</i>")
     if m["btc_oi"] is not None:
         L.append(f"BTC 合约持仓：${m['btc_oi'] / 1e9:.1f}B（{len(m['btc_oi_by_ex'])} 家合计）"
                  + (f"，24h {fmt_pct(m['oi_chg'])}" if m["oi_chg"] is not None else ""))
@@ -745,6 +852,7 @@ def sources_block(m):
     return ("<i>数据来源 · 现货：" + esc(names(m["btc_spot_src"]))
             + "；合约：" + esc(names(m["btc_perp_src"]))
             + "；日线：" + esc(names(m["daily_src"]))
+            + "；爆仓：" + esc(names(m["btc_liq_src"]))
             + "；DVOL：Deribit；恐惧贪婪：alternative.me；美股：Yahoo / FRED</i>")
 
 
