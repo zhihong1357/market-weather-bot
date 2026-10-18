@@ -28,6 +28,8 @@ import requests
 # 设置区（新手只需要看这里；数字都可以改）
 # ============================================================
 TIMEZONE_OFFSET_HOURS = 8        # 马来西亚时间 UTC+8
+# 除了你自己的私聊，还要同时收到通知的群 / 频道（bot 必须已经在群里，并且有发言权限）
+EXTRA_CHAT_IDS = ["-1004438833552"]
 MORNING_REPORT_HOUR = 8          # 每天几点发早报（本地时间）
 
 T = {
@@ -1806,16 +1808,25 @@ def find_chat_id(token):
     return None
 
 
-def send(token, chat_id, text, dry_run=False):
+def send(token, chat_ids, text, dry_run=False):
+    """发给每一个聊天；某个群发送失败不影响其他聊天，全部失败才报错。"""
     if dry_run or not token:
         print("=" * 50)
         print(text)
         print("=" * 50)
         return
-    for part in split_message(text):
-        tg_api(token, "sendMessage", {"chat_id": chat_id, "text": part,
-                                      "parse_mode": "HTML", "disable_web_page_preview": True})
-        time.sleep(1)
+    ok = 0
+    for chat_id in chat_ids:
+        try:
+            for part in split_message(text):
+                tg_api(token, "sendMessage", {"chat_id": chat_id, "text": part,
+                                              "parse_mode": "HTML", "disable_web_page_preview": True})
+                time.sleep(1)
+            ok += 1
+        except Exception as e:  # noqa
+            print(f"❗ 发送到 {chat_id} 失败：{e}（如果是群，请确认 bot 已经在群里并且可以发言）", file=sys.stderr)
+    if not ok:
+        raise RuntimeError("所有聊天都发送失败")
 
 
 def split_message(text, limit=3900):
@@ -1874,6 +1885,9 @@ def main():
             print("❗ 找不到聊天 ID：请先在 Telegram 里打开你的 bot，发一条消息（例如 /start），然后再运行一次。")
             sys.exit(1)
         state["chat_id"] = chat_id
+    # 私聊 + 设置区里的群；TG_CHAT_ID 也可以用逗号填多个
+    chat_ids = list(dict.fromkeys(
+        [x.strip() for x in str(chat_id or "").split(",") if x.strip()] + EXTRA_CHAT_IDS))
 
     if args.mock:
         with open(args.mock, encoding="utf-8") as f:
@@ -1914,14 +1928,14 @@ def main():
             state.pop("pending_state", None)
 
     if changed:
-        send(token, chat_id, build_change_alert(last, candidate, reasons, m, warns, now), dry)
+        send(token, chat_ids, build_change_alert(last, candidate, reasons, m, warns, now), dry)
         state["last_state"] = candidate
         state.pop("pending_state", None)
         state["last_change"] = now.isoformat(timespec="minutes")
 
     morning_due = now.hour >= MORNING_REPORT_HOUR and state.get("last_report_date") != today
     if force_report or morning_due:
-        send(token, chat_id, build_report(state["last_state"], reasons if state["last_state"] == candidate else [],
+        send(token, chat_ids, build_report(state["last_state"], reasons if state["last_state"] == candidate else [],
                                           m, warns, now, data["errors"], title=title), dry)
         if morning_due:
             state["last_report_date"] = today
